@@ -13,7 +13,7 @@ use crate::index::{
 };
 use arrow::compute::concat_batches;
 use arrow_arith::numeric::sub;
-use arrow_array::{Float32Array, RecordBatch, UInt32Array};
+use arrow_array::{ArrayRef, Float32Array, RecordBatch, UInt32Array};
 use async_trait::async_trait;
 use datafusion::execution::SendableRecordBatchStream;
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
@@ -601,6 +601,29 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> VectorIndex for IVFInd
 
     fn metric_type(&self) -> DistanceType {
         self.distance_type
+    }
+
+    fn build_precomputed_distance_table(
+        &self,
+        query: &ArrayRef,
+    ) -> Option<Arc<dyn Any + Send + Sync>> {
+        use lance_index::vector::pq::storage::ProductQuantizationMetadata;
+        use lance_index::vector::quantizer::QuantizerMetadata;
+
+        // Only PQ quantization supports precomputed distance tables
+        if Q::quantization_type() != QuantizationType::Product {
+            return None;
+        }
+
+        // Get the PQ metadata from the storage and downcast to ProductQuantizationMetadata
+        let metadata = self.storage.metadata();
+        let pq_metadata = metadata
+            .as_any()
+            .downcast_ref::<ProductQuantizationMetadata>()?;
+
+        // Build the distance table
+        let table = pq_metadata.build_distance_table(query, self.distance_type)?;
+        Some(Arc::new(table))
     }
 }
 

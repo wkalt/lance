@@ -1082,6 +1082,7 @@ impl Scanner {
             metric_type: default_distance_type_for(&element_type),
             use_index: true,
             dist_q_c: 0.0,
+            precomputed_distance_table: None,
         });
         Ok(self)
     }

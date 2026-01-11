@@ -113,6 +113,14 @@ pub struct Query {
     /// the distance between the query and the centroid
     /// this is only used for IVF index with Rabit quantization
     pub dist_q_c: f32,
+
+    /// Optional pre-computed distance table for PQ storage.
+    ///
+    /// When set, IVF partition searches can skip rebuilding the distance table,
+    /// which can significantly reduce CPU time for queries that search multiple
+    /// partitions. The table is typically a `PQDistanceTable` wrapped in Arc.
+    #[allow(clippy::type_complexity)]
+    pub precomputed_distance_table: Option<Arc<dyn Any + Send + Sync>>,
 }
 
 impl From<pb::VectorMetricType> for DistanceType {
@@ -261,6 +269,21 @@ pub trait VectorIndex: Send + Sync + std::fmt::Debug + Index {
 
     /// the index type of this vector index.
     fn sub_index_type(&self) -> (SubIndexType, QuantizationType);
+
+    /// Build a precomputed distance table for the given query.
+    ///
+    /// For IVF-PQ indices, this computes the PQ distance table once per query,
+    /// which can then be reused across all partition searches. This avoids
+    /// redundant computation when searching multiple partitions.
+    ///
+    /// Returns `None` if the index doesn't support precomputed tables or
+    /// if the quantizer is not PQ.
+    fn build_precomputed_distance_table(
+        &self,
+        _query: &ArrayRef,
+    ) -> Option<Arc<dyn Any + Send + Sync>> {
+        None
+    }
 }
 
 // it can be an IVF index or a partition of IVF index

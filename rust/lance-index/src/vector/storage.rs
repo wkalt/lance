@@ -97,6 +97,25 @@ pub trait VectorStore: Send + Sync + Sized + Clone {
     /// values.
     fn dist_calculator(&self, query: ArrayRef, dist_q_c: f32) -> Self::DistanceCalculator<'_>;
 
+    /// Create a [DistCalculator] with an optional precomputed distance table.
+    ///
+    /// For PQ-based storage, the `precomputed` parameter can be a `PQDistanceTable`
+    /// that was computed once for the query and can be reused across partitions.
+    /// Other storage types ignore this parameter and fall back to `dist_calculator`.
+    ///
+    /// This optimization can significantly reduce CPU time when searching multiple
+    /// IVF partitions with the same query, as the distance table only needs to be
+    /// built once per query instead of once per partition.
+    fn dist_calculator_with_precomputed(
+        &self,
+        query: ArrayRef,
+        dist_q_c: f32,
+        _precomputed: Option<&(dyn Any + Send + Sync)>,
+    ) -> Self::DistanceCalculator<'_> {
+        // Default implementation ignores precomputed and falls back to regular method
+        self.dist_calculator(query, dist_q_c)
+    }
+
     fn dist_calculator_from_id(&self, id: u32) -> Self::DistanceCalculator<'_>;
 
     fn dist_between(&self, u: u32, v: u32) -> f32 {

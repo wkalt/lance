@@ -61,6 +61,10 @@ impl DeepSizeOf for RabitQuantizationMetadata {
 
 #[async_trait]
 impl QuantizerMetadata for RabitQuantizationMetadata {
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+
     fn buffer_index(&self) -> Option<u32> {
         Some(self.rotate_mat_position)
     }

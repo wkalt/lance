@@ -2,6 +2,7 @@
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
 use core::fmt;
+use std::any::Any;
 use std::str::FromStr;
 use std::sync::Arc;
 use std::{collections::HashMap, fmt::Debug};
@@ -201,8 +202,11 @@ pub struct QuantizationMetadata {
 
 #[async_trait]
 pub trait QuantizerMetadata:
-    fmt::Debug + Clone + Sized + DeepSizeOf + for<'a> Deserialize<'a> + Serialize
+    fmt::Debug + Clone + Sized + DeepSizeOf + for<'a> Deserialize<'a> + Serialize + 'static
 {
+    /// Return self as Any for downcasting to concrete types.
+    fn as_any(&self) -> &dyn Any;
+
     // the extra metadata index in global buffer
     fn buffer_index(&self) -> Option<u32> {
         None

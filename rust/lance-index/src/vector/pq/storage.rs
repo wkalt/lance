@@ -32,7 +32,9 @@ use prost::Message;
 use serde::{Deserialize, Serialize};
 use snafu::location;
 
-use super::distance::{build_distance_table_dot, build_distance_table_l2, compute_pq_distance};
+use super::distance::{
+    build_distance_table_dot, build_distance_table_l2, compute_pq_distance, PQDistanceTable,
+};
 use super::ProductQuantizer;
 use crate::frag_reuse::FragReuseIndex;
 use crate::{
@@ -86,6 +88,10 @@ impl PartialEq for ProductQuantizationMetadata {
 
 #[async_trait]
 impl QuantizerMetadata for ProductQuantizationMetadata {
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+
     fn buffer_index(&self) -> Option<u32> {
         if self.codebook_position > 0 {
             // the global buffer index starts from 1
@@ -139,6 +145,91 @@ impl QuantizerMetadata for ProductQuantizationMetadata {
             read_message(reader.object_reader.as_ref(), metadata.codebook_position).await?;
         metadata.codebook = Some(FixedSizeListArray::try_from(&codebook_tensor)?);
         Ok(metadata)
+    }
+}
+
+impl ProductQuantizationMetadata {
+    /// Build a pre-computed distance table for a query vector.
+    ///
+    /// This table can be reused across multiple partition searches with the same query,
+    /// avoiding redundant computation of distances from the query to all PQ centroids.
+    ///
+    /// Returns `None` if the codebook is not loaded.
+    pub fn build_distance_table(
+        &self,
+        query: &ArrayRef,
+        distance_type: DistanceType,
+    ) -> Option<PQDistanceTable> {
+        let codebook = self.codebook.as_ref()?;
+        match codebook.value_type() {
+            DataType::Float16 => {
+                let codebook_values = codebook
+                    .values()
+                    .as_primitive::<datatypes::Float16Type>()
+                    .values();
+                let query_values = query.as_primitive::<datatypes::Float16Type>().values();
+                Some(match distance_type {
+                    DistanceType::L2 | DistanceType::Cosine => PQDistanceTable::build_l2(
+                        codebook_values,
+                        self.nbits,
+                        self.num_sub_vectors,
+                        query_values,
+                    ),
+                    DistanceType::Dot => PQDistanceTable::build_dot(
+                        codebook_values,
+                        self.nbits,
+                        self.num_sub_vectors,
+                        query_values,
+                    ),
+                    _ => return None,
+                })
+            }
+            DataType::Float32 => {
+                let codebook_values = codebook
+                    .values()
+                    .as_primitive::<datatypes::Float32Type>()
+                    .values();
+                let query_values = query.as_primitive::<datatypes::Float32Type>().values();
+                Some(match distance_type {
+                    DistanceType::L2 | DistanceType::Cosine => PQDistanceTable::build_l2(
+                        codebook_values,
+                        self.nbits,
+                        self.num_sub_vectors,
+                        query_values,
+                    ),
+                    DistanceType::Dot => PQDistanceTable::build_dot(
+                        codebook_values,
+                        self.nbits,
+                        self.num_sub_vectors,
+                        query_values,
+                    ),
+                    _ => return None,
+                })
+            }
+            DataType::Float64 => {
+                let codebook_values = codebook
+                    .values()
+                    .as_primitive::<datatypes::Float64Type>()
+                    .values();
+                let query_values = query.as_primitive::<datatypes::Float64Type>().values();
+                Some(match distance_type {
+                    DistanceType::L2 | DistanceType::Cosine => PQDistanceTable::build_l2(
+                        codebook_values,
+                        self.nbits,
+                        self.num_sub_vectors,
+                        query_values,
+                    ),
+                    DistanceType::Dot => PQDistanceTable::build_dot(
+                        codebook_values,
+                        self.nbits,
+                        self.num_sub_vectors,
+                        query_values,
+                    ),
+                    _ => return None,
+                })
+            }
+            _ => None,
+        }
     }
 }
 
@@ -672,6 +763,22 @@ impl VectorStore for ProductQuantizationStorage {
         }
     }
 
+    fn dist_calculator_with_precomputed(
+        &self,
+        query: ArrayRef,
+        dist_q_c: f32,
+        precomputed: Option<&(dyn std::any::Any + Send + Sync)>,
+    ) -> Self::DistanceCalculator<'_> {
+        // Try to use pre-computed distance table if available
+        if let Some(precomputed) = precomputed {
+            if let Some(table) = precomputed.downcast_ref::<PQDistanceTable>() {
+                return PQDistCalculator::with_table(table, self.pq_code.clone());
+            }
+        }
+        // Fall back to computing the table
+        self.dist_calculator(query, dist_q_c)
+    }
+
     fn dist_calculator_from_id(&self, id: u32) -> Self::DistanceCalculator<'_> {
         let codes = get_pq_code(
             self.pq_code.values(),
@@ -874,6 +981,20 @@ impl PQDistCalculator {
             pq_code,
             num_bits,
             distance_type,
+        }
+    }
+
+    /// Create a PQDistCalculator with a pre-computed distance table.
+    ///
+    /// This is more efficient when searching multiple partitions with the same query,
+    /// as the distance table only needs to be computed once per query.
+    pub fn with_table(table: &PQDistanceTable, pq_code: Arc<UInt8Array>) -> Self {
+        Self {
+            distance_table: table.table.to_vec(),
+            num_sub_vectors: table.num_sub_vectors,
+            pq_code,
+            num_bits: table.num_bits,
+            distance_type: table.distance_type,
         }
     }
 

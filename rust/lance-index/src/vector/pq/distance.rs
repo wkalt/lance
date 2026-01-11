@@ -3,14 +3,73 @@
 
 use core::panic;
 use std::cmp::{max, min};
+use std::sync::Arc;
 
 use lance_core::assume_eq;
-use lance_linalg::distance::{dot_distance_batch, l2_distance_batch, Dot, L2};
+use lance_linalg::distance::{dot_distance_batch, l2_distance_batch, DistanceType, Dot, L2};
 use lance_linalg::simd::u8::u8x16;
 use lance_linalg::simd::{Shuffle, SIMD};
 use lance_table::utils::LanceIteratorExtension;
 
 use super::{num_centroids, utils::get_sub_vector_centroids};
+
+/// Pre-computed PQ distance table that can be shared across partitions.
+///
+/// The distance table only depends on:
+/// - Query vector
+/// - PQ codebook (shared across all IVF partitions)
+/// - num_bits, num_sub_vectors, distance_type
+///
+/// It does NOT depend on the partition's PQ codes, so it can be computed
+/// once per query and reused across all partition searches.
+#[derive(Clone, Debug)]
+pub struct PQDistanceTable {
+    /// The pre-computed distance table. Shape: [num_sub_vectors * num_centroids]
+    pub table: Arc<[f32]>,
+    pub num_sub_vectors: usize,
+    pub num_bits: u32,
+    pub distance_type: DistanceType,
+}
+
+impl PQDistanceTable {
+    /// Build a distance table from L2 distances.
+    pub fn build_l2<T: L2>(
+        codebook: &[T],
+        num_bits: u32,
+        num_sub_vectors: usize,
+        query: &[T],
+    ) -> Self {
+        let table = build_distance_table_l2(codebook, num_bits, num_sub_vectors, query);
+        Self {
+            table: table.into(),
+            num_sub_vectors,
+            num_bits,
+            distance_type: DistanceType::L2,
+        }
+    }
+
+    /// Build a distance table from Dot product distances.
+    pub fn build_dot<T: Dot>(
+        codebook: &[T],
+        num_bits: u32,
+        num_sub_vectors: usize,
+        query: &[T],
+    ) -> Self {
+        let table = build_distance_table_dot(codebook, num_bits, num_sub_vectors, query);
+        Self {
+            table: table.into(),
+            num_sub_vectors,
+            num_bits,
+            distance_type: DistanceType::Dot,
+        }
+    }
+
+    /// Get a reference to the underlying table data.
+    #[inline]
+    pub fn as_slice(&self) -> &[f32] {
+        &self.table
+    }
+}
 
 // for quantizing the distance table, we need to know the max possible distance,
 // so we perform a flat search on the first `FLAT_NUM_4BIT_PQ` rows.

@@ -52,6 +52,10 @@ impl DeepSizeOf for ScalarQuantizationMetadata {
 
 #[async_trait]
 impl QuantizerMetadata for ScalarQuantizationMetadata {
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+
     async fn load(reader: &PreviousFileReader) -> Result<Self> {
         let metadata_str = reader
             .schema()

@@ -714,13 +714,23 @@ impl ANNIvfEarlySearchResults {
 impl ANNIvfSubIndexExec {
     fn late_search(
         index: Arc<dyn VectorIndex>,
-        query: Query,
+        mut query: Query,
         partitions: Arc<UInt32Array>,
         q_c_dists: Arc<Float32Array>,
         prefilter: Arc<DatasetPreFilter>,
         metrics: Arc<AnnIndexMetrics>,
         state: Arc<ANNIvfEarlySearchResults>,
     ) -> impl Stream<Item = DataFusionResult<RecordBatch>> {
+        // Normalize query key once if using Cosine distance
+        if index.metric_type() == DistanceType::Cosine {
+            if let Ok((normalized, _)) = normalize_arrow(&query.key) {
+                query.key = normalized;
+            }
+        }
+
+        // Build precomputed distance table once for all partition searches
+        query.precomputed_distance_table = index.build_precomputed_distance_table(&query.key);
+
         let stream = futures::stream::once(async move {
             let max_nprobes = query
                 .maximum_nprobes
@@ -799,12 +809,7 @@ impl ANNIvfSubIndexExec {
                     let state = state.clone();
                     let index = index.clone();
                     async move {
-                        let mut query = query.clone();
-                        if index.metric_type() == DistanceType::Cosine {
-                            let key = normalize_arrow(&query.key)?.0;
-                            query.key = key;
-                        };
-
+                        // Note: query key is already normalized above if needed
                         metrics.partitions_searched.add(1);
                         let batch = index
                             .search_in_partition(
@@ -837,7 +842,7 @@ impl ANNIvfSubIndexExec {
 
     fn initial_search(
         index: Arc<dyn VectorIndex>,
-        query: Query,
+        mut query: Query,
         partitions: Arc<UInt32Array>,
         q_c_dists: Arc<Float32Array>,
         prefilter: Arc<DatasetPreFilter>,
@@ -846,6 +851,18 @@ impl ANNIvfSubIndexExec {
     ) -> impl Stream<Item = DataFusionResult<RecordBatch>> {
         let minimum_nprobes = query.minimum_nprobes.min(partitions.len());
         metrics.partitions_searched.add(minimum_nprobes);
+
+        // Normalize query key once if using Cosine distance
+        if index.metric_type() == DistanceType::Cosine {
+            if let Ok((normalized, _)) = normalize_arrow(&query.key) {
+                query.key = normalized;
+            }
+        }
+
+        // Build precomputed distance table once for all partition searches
+        // This is a significant optimization for PQ indices - the distance table
+        // only depends on the query and codebook, not the partition.
+        query.precomputed_distance_table = index.build_precomputed_distance_table(&query.key);
 
         futures::stream::iter(0..minimum_nprobes)
             .map(move |idx| {
@@ -857,12 +874,7 @@ impl ANNIvfSubIndexExec {
                 let pre_filter = prefilter.clone();
                 let state = state.clone();
                 async move {
-                    let mut query = query.clone();
-                    if index.metric_type() == DistanceType::Cosine {
-                        let key = normalize_arrow(&query.key)?.0;
-                        query.key = key;
-                    };
-
+                    // Note: query key is already normalized above if needed
                     let batch = index
                         .search_in_partition(
                             part_id as usize,

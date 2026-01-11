@@ -29,6 +29,7 @@ pub mod transform;
 pub(crate) mod utils;
 
 use self::distance::{build_distance_table_l2, compute_pq_distance};
+pub use self::distance::PQDistanceTable;
 pub use self::utils::num_centroids;
 use super::quantizer::{
     Quantization, QuantizationMetadata, QuantizationType, Quantizer, QuantizerBuildParams,

@@ -4,6 +4,7 @@
 //! Flat Vector Index.
 //!
 
+use std::any::Any;
 use std::collections::{BinaryHeap, HashMap};
 use std::sync::Arc;
 
@@ -48,9 +49,12 @@ static ANN_SEARCH_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
 
 #[derive(Default)]
 pub struct FlatQueryParams {
-    lower_bound: Option<f32>,
-    upper_bound: Option<f32>,
-    dist_q_c: f32,
+    pub lower_bound: Option<f32>,
+    pub upper_bound: Option<f32>,
+    pub dist_q_c: f32,
+    /// Optional pre-computed distance table for PQ storage.
+    /// When set, partition searches can skip rebuilding the distance table.
+    pub precomputed_distance_table: Option<Arc<dyn Any + Send + Sync>>,
 }
 
 impl From<&Query> for FlatQueryParams {
@@ -59,6 +63,7 @@ impl From<&Query> for FlatQueryParams {
             lower_bound: q.lower_bound,
             upper_bound: q.upper_bound,
             dist_q_c: q.dist_q_c,
+            precomputed_distance_table: q.precomputed_distance_table.clone(),
         }
     }
 }
@@ -90,7 +95,12 @@ impl IvfSubIndex for FlatIndex {
     ) -> Result<RecordBatch> {
         let is_range_query = params.lower_bound.is_some() || params.upper_bound.is_some();
         let row_ids = storage.row_ids();
-        let dist_calc = storage.dist_calculator(query, params.dist_q_c);
+        // Use precomputed distance table if available (for PQ storage optimization)
+        let dist_calc = storage.dist_calculator_with_precomputed(
+            query,
+            params.dist_q_c,
+            params.precomputed_distance_table.as_ref().map(|t| t.as_ref()),
+        );
         let mut res = BinaryHeap::with_capacity(k);
         metrics.record_comparisons(storage.len());
 
@@ -203,6 +213,10 @@ pub struct FlatMetadata {
 
 #[async_trait::async_trait]
 impl QuantizerMetadata for FlatMetadata {
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+
     async fn load(_: &PreviousFileReader) -> Result<Self> {
         unimplemented!("Flat will be used in new index builder which doesn't require this")
     }
