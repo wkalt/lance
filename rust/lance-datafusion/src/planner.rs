@@ -5,7 +5,7 @@
 
 use std::borrow::Cow;
 use std::collections::{BTreeSet, VecDeque};
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 
 use crate::exec::{get_session_context, LanceExecutionOptions};
 use crate::expr::safe_coerce_scalar;
@@ -159,8 +159,14 @@ struct LanceContextProvider {
     expr_planners: Vec<Arc<dyn ExprPlanner>>,
 }
 
-impl Default for LanceContextProvider {
-    fn default() -> Self {
+// Cache the default LanceContextProvider to avoid expensive SessionState cloning
+// on every Planner::new() call. SessionState contains HashMaps with all registered
+// UDFs which are expensive to clone.
+static DEFAULT_CONTEXT_PROVIDER: LazyLock<Arc<LanceContextProvider>> =
+    LazyLock::new(|| Arc::new(LanceContextProvider::new_default()));
+
+impl LanceContextProvider {
+    fn new_default() -> Self {
         let ctx = get_session_context(&LanceExecutionOptions::default());
         let state = ctx.state();
         let expr_planners = state.expr_planners().to_vec();
@@ -170,6 +176,12 @@ impl Default for LanceContextProvider {
             state,
             expr_planners,
         }
+    }
+}
+
+impl Default for LanceContextProvider {
+    fn default() -> Self {
+        Self::new_default()
     }
 }
 
@@ -229,7 +241,7 @@ impl ContextProvider for LanceContextProvider {
 
 pub struct Planner {
     schema: SchemaRef,
-    context_provider: LanceContextProvider,
+    context_provider: Arc<LanceContextProvider>,
     enable_relations: bool,
 }
 
@@ -237,7 +249,7 @@ impl Planner {
     pub fn new(schema: SchemaRef) -> Self {
         Self {
             schema,
-            context_provider: LanceContextProvider::default(),
+            context_provider: DEFAULT_CONTEXT_PROVIDER.clone(),
             enable_relations: false,
         }
     }
@@ -428,7 +440,7 @@ impl Planner {
             }
         }
         let sql_to_rel = SqlToRel::new_with_options(
-            &self.context_provider,
+            self.context_provider.as_ref(),
             ParserOptions {
                 parse_float_as_decimal: false,
                 enable_ident_normalization: false,
