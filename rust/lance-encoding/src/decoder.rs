@@ -394,6 +394,9 @@ pub struct DecodeBatchScheduler {
     root_scheduler: RootScheduler,
     pub root_fields: Fields,
     cache: Arc<LanceCache>,
+    /// Tracks cumulative rows scheduled across multiple calls to schedule_ranges_to_vec.
+    /// This allows incremental scheduling with correct scheduled_so_far values.
+    rows_scheduled_offset: u64,
 }
 
 pub struct ColumnInfoIter<'a> {
@@ -1016,6 +1019,7 @@ impl DecodeBatchScheduler {
                 root_scheduler: RootScheduler::Structural(root_scheduler),
                 root_fields,
                 cache,
+                rows_scheduled_offset: 0,
             })
         } else {
             // The old encoding style expected a header column for structs and so we
@@ -1040,6 +1044,7 @@ impl DecodeBatchScheduler {
                 root_scheduler: RootScheduler::Legacy(root_scheduler.into()),
                 root_fields,
                 cache,
+                rows_scheduled_offset: 0,
             })
         }
     }
@@ -1054,6 +1059,7 @@ impl DecodeBatchScheduler {
             root_scheduler: RootScheduler::Legacy(root_scheduler),
             root_fields,
             cache,
+            rows_scheduled_offset: 0,
         }
     }
 
@@ -1072,7 +1078,8 @@ impl DecodeBatchScheduler {
             return;
         }
         let mut root_job = maybe_root_job.unwrap();
-        let mut num_rows_scheduled = 0;
+        // Start from the offset to support incremental scheduling across multiple calls
+        let mut num_rows_scheduled = self.rows_scheduled_offset;
         loop {
             let maybe_next_scan_lines = root_job.schedule_next(&mut context);
             if let Err(err) = maybe_next_scan_lines {
@@ -1081,6 +1088,8 @@ impl DecodeBatchScheduler {
             }
             let next_scan_lines = maybe_next_scan_lines.unwrap();
             if next_scan_lines.is_empty() {
+                // Update offset for potential subsequent calls
+                self.rows_scheduled_offset = num_rows_scheduled;
                 return;
             }
             for next_scan_line in next_scan_lines {
@@ -1095,7 +1104,8 @@ impl DecodeBatchScheduler {
                     decoders: next_scan_line.decoders,
                     backpressure_permit: None,
                 })) {
-                    // Decoder has disconnected
+                    // Decoder has disconnected - still update offset
+                    self.rows_scheduled_offset = num_rows_scheduled;
                     return;
                 }
             }
@@ -1134,7 +1144,8 @@ impl DecodeBatchScheduler {
             return;
         }
         let mut root_job = maybe_root_job.unwrap();
-        let mut num_rows_scheduled = 0;
+        // Start from the offset to support incremental scheduling across multiple calls
+        let mut num_rows_scheduled = self.rows_scheduled_offset;
         let mut rows_to_schedule = root_job.num_rows();
         let mut priority = priority.unwrap_or(Box::new(SimplePriorityRange::new(0)));
         trace!("Scheduled ranges refined to {} rows", rows_to_schedule);
@@ -1142,6 +1153,7 @@ impl DecodeBatchScheduler {
             let maybe_next_scan_line = root_job.schedule_next(&mut context, priority.as_ref());
             if let Err(schedule_next_err) = maybe_next_scan_line {
                 schedule_action(Err(schedule_next_err));
+                self.rows_scheduled_offset = num_rows_scheduled;
                 return;
             }
             let next_scan_line = maybe_next_scan_line.unwrap();
@@ -1158,12 +1170,15 @@ impl DecodeBatchScheduler {
                 decoders: next_scan_line.decoders,
                 backpressure_permit: None,
             })) {
-                // Decoder has disconnected
+                // Decoder has disconnected - still update offset
+                self.rows_scheduled_offset = num_rows_scheduled;
                 return;
             }
 
             trace!("Finished scheduling {} ranges", ranges.len());
         }
+        // Update offset for potential subsequent calls
+        self.rows_scheduled_offset = num_rows_scheduled;
     }
 
     fn do_schedule_ranges(
@@ -2210,21 +2225,35 @@ fn create_scheduler_decoder_bounded(
             }
         };
 
-        // Schedule ranges incrementally with backpressure via semaphore.
-        // Acquiring a permit before scheduling ensures we don't have too many
-        // messages in flight, which limits memory consumption.
+        // Schedule ranges/indices incrementally with backpressure via semaphore.
+        //
+        // IMPORTANT: We acquire a permit BEFORE scheduling I/O, not before sending messages.
+        // This is critical because scheduling fires I/O requests that load data into memory.
+        // If we only limit message sending, unlimited I/O can accumulate while waiting for permits.
+        //
+        // Flow:
+        // 1. Acquire permit (blocks if too many chunks have pending I/O)
+        // 2. Schedule I/O for one chunk/range (fires I/O requests)
+        // 3. Send resulting messages
+        // 4. Permit is released when the LAST message from this chunk is processed
+        //
+        // This limits memory to: channel_capacity * (data per chunk)
         match requested_rows {
             RequestedRows::Ranges(ranges) => {
-                // Schedule one range at a time to limit I/O in flight
+                // Chunk ranges into batch_size pieces to limit I/O in flight.
+                // A single large range (e.g., 0..10000 for a full fragment read)
+                // would otherwise schedule all I/O at once, defeating backpressure.
+                let batch_size = config.batch_size as u64;
+
                 for range in ranges {
-                    let messages = decode_scheduler
-                        .schedule_ranges_to_vec(&[range.clone()], &filter, config.io.clone(), None)
-                        .map(|msgs| msgs.into_iter().map(Ok).collect::<Vec<_>>())
-                        .unwrap_or_else(|e| vec![Err(e)]);
-                    for msg in messages {
-                        // Acquire permit before sending - this awaits if too many messages in flight
+                    let mut start = range.start;
+                    while start < range.end {
+                        let end = (start + batch_size).min(range.end);
+                        let chunk_range = start..end;
+
+                        // Acquire permit BEFORE scheduling I/O to limit data in flight
                         let permit = match scheduler_semaphore.clone().acquire_owned().await {
-                            Ok(permit) => Some(permit),
+                            Ok(permit) => permit,
                             Err(_) => {
                                 // Semaphore closed - decoder must have been dropped
                                 debug!(
@@ -2234,19 +2263,45 @@ fn create_scheduler_decoder_bounded(
                             }
                         };
 
-                        // Attach permit to message - released when message is dropped after processing
-                        let msg_with_permit = msg.map(|m| DecoderMessage {
-                            scheduled_so_far: m.scheduled_so_far,
-                            decoders: m.decoders,
-                            backpressure_permit: permit,
-                        });
+                        // Now schedule I/O for this chunk - this fires I/O requests
+                        let messages = decode_scheduler
+                            .schedule_ranges_to_vec(
+                                &[chunk_range],
+                                &filter,
+                                config.io.clone(),
+                                None,
+                            )
+                            .map(|msgs| msgs.into_iter().map(Ok).collect::<Vec<_>>())
+                            .unwrap_or_else(|e| vec![Err(e)]);
 
-                        if tx.send(msg_with_permit).is_err() {
-                            debug!(
-                                "create_scheduler_decoder_bounded aborting early since decoder appears to have been dropped"
-                            );
-                            return;
+                        // Send messages, attaching permit to the LAST one
+                        // This ensures permit is held until all messages from this chunk are processed
+                        let msg_count = messages.len();
+                        let mut permit_opt = Some(permit);
+
+                        for (idx, msg) in messages.into_iter().enumerate() {
+                            // Attach permit only to the last message
+                            let msg_permit = if idx == msg_count - 1 {
+                                permit_opt.take()
+                            } else {
+                                None
+                            };
+
+                            let msg_with_permit = msg.map(|m| DecoderMessage {
+                                scheduled_so_far: m.scheduled_so_far,
+                                decoders: m.decoders,
+                                backpressure_permit: msg_permit,
+                            });
+
+                            if tx.send(msg_with_permit).is_err() {
+                                debug!(
+                                    "create_scheduler_decoder_bounded aborting early since decoder appears to have been dropped"
+                                );
+                                return;
+                            }
                         }
+
+                        start = end;
                     }
                 }
             }
@@ -2255,26 +2310,38 @@ fn create_scheduler_decoder_bounded(
                 // Use batch_size as chunk size for reasonable granularity
                 let chunk_size = config.batch_size as usize;
                 for chunk in indices.chunks(chunk_size) {
-                    // schedule_take_bounded converts indices to ranges internally
+                    // Acquire permit BEFORE scheduling I/O to limit data in flight
+                    let permit = match scheduler_semaphore.clone().acquire_owned().await {
+                        Ok(permit) => permit,
+                        Err(_) => {
+                            // Semaphore closed - decoder must have been dropped
+                            debug!(
+                                "create_scheduler_decoder_bounded aborting early since semaphore was closed"
+                            );
+                            return;
+                        }
+                    };
+
+                    // Now schedule I/O - this fires I/O requests
                     let messages = decode_scheduler.schedule_take_bounded(chunk, &filter, config.io.clone());
-                    for msg in messages {
-                        // Acquire permit before sending - this awaits if too many messages in flight
-                        let permit = match scheduler_semaphore.clone().acquire_owned().await {
-                            Ok(permit) => Some(permit),
-                            Err(_) => {
-                                // Semaphore closed - decoder must have been dropped
-                                debug!(
-                                    "create_scheduler_decoder_bounded aborting early since semaphore was closed"
-                                );
-                                return;
-                            }
+
+                    // Send messages, attaching permit to the LAST one
+                    // This ensures permit is held until all messages from this chunk are processed
+                    let msg_count = messages.len();
+                    let mut permit_opt = Some(permit);
+
+                    for (idx, msg) in messages.into_iter().enumerate() {
+                        // Attach permit only to the last message
+                        let msg_permit = if idx == msg_count - 1 {
+                            permit_opt.take()
+                        } else {
+                            None
                         };
 
-                        // Attach permit to message - released when message is dropped after processing
                         let msg_with_permit = msg.map(|m| DecoderMessage {
                             scheduled_so_far: m.scheduled_so_far,
                             decoders: m.decoders,
-                            backpressure_permit: permit,
+                            backpressure_permit: msg_permit,
                         });
 
                         if tx.send(msg_with_permit).is_err() {
