@@ -116,6 +116,10 @@ pub struct KNNVectorDistanceExec {
     pub column: String,
     pub distance_type: DistanceType,
 
+    /// Number of batches to compute distances for in parallel.
+    /// Default is num_cpus for backwards compatibility.
+    parallelism: usize,
+
     output_schema: SchemaRef,
     properties: PlanProperties,
 
@@ -173,10 +177,18 @@ impl KNNVectorDistanceExec {
             query,
             column: column.to_string(),
             distance_type,
+            parallelism: get_num_compute_intensive_cpus(),
             output_schema,
             properties,
             metrics: ExecutionPlanMetricsSet::new(),
         })
+    }
+
+    /// Set the parallelism for distance computation.
+    /// Lower values reduce memory usage at the cost of throughput.
+    pub fn with_parallelism(mut self, parallelism: usize) -> Self {
+        self.parallelism = parallelism.max(1);
+        self
     }
 }
 
@@ -208,12 +220,15 @@ impl ExecutionPlan for KNNVectorDistanceExec {
             ));
         }
 
-        Ok(Arc::new(Self::try_new(
-            children.pop().expect("length checked"),
-            &self.column,
-            self.query.clone(),
-            self.distance_type,
-        )?))
+        Ok(Arc::new(
+            Self::try_new(
+                children.pop().expect("length checked"),
+                &self.column,
+                self.query.clone(),
+                self.distance_type,
+            )?
+            .with_parallelism(self.parallelism),
+        ))
     }
 
     fn execute(
@@ -236,7 +251,7 @@ impl ExecutionPlan for KNNVectorDistanceExec {
                         .map_err(|e| DataFusionError::Execution(e.to_string()))
                 }
             })
-            .buffer_unordered(get_num_compute_intensive_cpus());
+            .buffer_unordered(self.parallelism);
         let schema = self.schema();
         Ok(Box::pin(InstrumentedRecordBatchStreamAdapter::new(
             schema,
