@@ -334,6 +334,10 @@ pub struct FileReaderOptions {
     /// will be read in multiple chunks to control memory usage.
     /// Default: 8MB (DEFAULT_READ_CHUNK_SIZE)
     pub read_chunk_size: u64,
+    /// Capacity of channel between scheduler and decoder.
+    /// If None, uses unbounded channel (legacy behavior).
+    /// If Some, creates bounded channel with backpressure.
+    pub decode_channel_capacity: Option<usize>,
 }
 
 impl Default for FileReaderOptions {
@@ -341,6 +345,7 @@ impl Default for FileReaderOptions {
         Self {
             decoder_config: DecoderConfig::default(),
             read_chunk_size: DEFAULT_READ_CHUNK_SIZE,
+            decode_channel_capacity: None,
         }
     }
 }
@@ -870,6 +875,7 @@ impl FileReader {
         projection: ReaderProjection,
         filter: FilterExpression,
         decoder_config: DecoderConfig,
+        decode_channel_capacity: Option<usize>,
     ) -> Result<BoxStream<'static, ReadBatchTask>> {
         debug!(
             "Reading range {:?} with batch_size {} from file with {} rows and {} columns into schema with {} columns",
@@ -886,7 +892,7 @@ impl FileReader {
             decoder_plugins,
             io,
             decoder_config,
-            decode_channel_capacity: None,
+            decode_channel_capacity,
         };
 
         let requested_rows = RequestedRows::Ranges(vec![range]);
@@ -920,6 +926,7 @@ impl FileReader {
             projection,
             filter,
             self.options.decoder_config.clone(),
+            self.options.decode_channel_capacity,
         )
     }
 
@@ -934,6 +941,7 @@ impl FileReader {
         projection: ReaderProjection,
         filter: FilterExpression,
         decoder_config: DecoderConfig,
+        decode_channel_capacity: Option<usize>,
     ) -> Result<BoxStream<'static, ReadBatchTask>> {
         debug!(
             "Taking {} rows spread across range {}..{} with batch_size {} from columns {:?}",
@@ -950,7 +958,7 @@ impl FileReader {
             decoder_plugins,
             io,
             decoder_config,
-            decode_channel_capacity: None,
+            decode_channel_capacity,
         };
 
         let requested_rows = RequestedRows::Indices(indices);
@@ -982,6 +990,7 @@ impl FileReader {
             projection,
             FilterExpression::no_filter(),
             self.options.decoder_config.clone(),
+            self.options.decode_channel_capacity,
         )
     }
 
@@ -996,6 +1005,7 @@ impl FileReader {
         projection: ReaderProjection,
         filter: FilterExpression,
         decoder_config: DecoderConfig,
+        decode_channel_capacity: Option<usize>,
     ) -> Result<BoxStream<'static, ReadBatchTask>> {
         let num_rows = ranges.iter().map(|r| r.end - r.start).sum::<u64>();
         debug!(
@@ -1014,7 +1024,7 @@ impl FileReader {
             decoder_plugins,
             io,
             decoder_config,
-            decode_channel_capacity: None,
+            decode_channel_capacity,
         };
 
         let requested_rows = RequestedRows::Ranges(ranges);
@@ -1046,6 +1056,7 @@ impl FileReader {
             projection,
             filter,
             self.options.decoder_config.clone(),
+            self.options.decode_channel_capacity,
         )
     }
 
@@ -1199,7 +1210,7 @@ impl FileReader {
             decoder_plugins: self.decoder_plugins.clone(),
             io: self.scheduler.clone(),
             decoder_config: self.options.decoder_config.clone(),
-            decode_channel_capacity: None,
+            decode_channel_capacity: self.options.decode_channel_capacity,
         };
 
         let requested_rows = RequestedRows::Indices(indices);
@@ -1239,7 +1250,7 @@ impl FileReader {
             decoder_plugins: self.decoder_plugins.clone(),
             io: self.scheduler.clone(),
             decoder_config: self.options.decoder_config.clone(),
-            decode_channel_capacity: None,
+            decode_channel_capacity: self.options.decode_channel_capacity,
         };
 
         let requested_rows = RequestedRows::Ranges(ranges);
@@ -1279,7 +1290,7 @@ impl FileReader {
             decoder_plugins: self.decoder_plugins.clone(),
             io: self.scheduler.clone(),
             decoder_config: self.options.decoder_config.clone(),
-            decode_channel_capacity: None,
+            decode_channel_capacity: self.options.decode_channel_capacity,
         };
 
         let requested_rows = RequestedRows::Ranges(vec![range]);

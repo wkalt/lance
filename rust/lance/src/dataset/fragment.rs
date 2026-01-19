@@ -600,7 +600,7 @@ impl GenericFileReader for NullReader {
     }
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 pub struct FragReadConfig {
     // Add the row id column
     pub with_row_id: bool,

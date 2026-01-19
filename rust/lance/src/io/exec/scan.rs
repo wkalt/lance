@@ -27,6 +27,7 @@ use lance_arrow::SchemaExt;
 use lance_core::utils::tokio::get_num_compute_intensive_cpus;
 use lance_core::utils::tracing::StreamTracingExt;
 use lance_core::{Error, ROW_ADDR_FIELD, ROW_ID_FIELD};
+use lance_file::reader::FileReaderOptions;
 use lance_io::scheduler::{ScanScheduler, SchedulerConfig};
 use lance_table::format::Fragment;
 use log::debug;
@@ -42,6 +43,24 @@ use crate::dataset::Dataset;
 use crate::datatypes::Schema;
 
 use super::utils::IoMetrics;
+
+/// Build a FragReadConfig from LanceScanConfig, including decode_channel_capacity if set.
+fn build_frag_read_config(config: &LanceScanConfig) -> FragReadConfig {
+    let mut frag_config = FragReadConfig::default()
+        .with_row_id(config.with_row_id)
+        .with_row_address(config.with_row_address)
+        .with_row_last_updated_at_version(config.with_row_last_updated_at_version)
+        .with_row_created_at_version(config.with_row_created_at_version);
+
+    if let Some(capacity) = config.decode_channel_capacity {
+        frag_config = frag_config.with_file_reader_options(FileReaderOptions {
+            decode_channel_capacity: Some(capacity),
+            ..FileReaderOptions::default()
+        });
+    }
+
+    frag_config
+}
 
 async fn open_file(
     file_fragment: FileFragment,
@@ -278,10 +297,18 @@ impl LanceStream {
 
         let scan_scheduler_clone = scan_scheduler.clone();
 
+        // Build FragReadConfig once before closures to avoid ownership issues
+        let frag_read_config = build_frag_read_config(&config);
+        // Copy values we need after the closure
+        let batch_readahead = config.batch_readahead;
+        let batch_size = config.batch_size;
+        let with_make_deletions_null = config.with_make_deletions_null;
+
         let batches = stream::iter(file_fragments.into_iter().enumerate())
             .map(move |(priority, file_fragment)| {
                 let project_schema = project_schema.clone();
                 let scan_scheduler = scan_scheduler.clone();
+                let frag_read_config = frag_read_config.clone();
                 #[allow(clippy::type_complexity)]
                 let frag_task: BoxFuture<
                     Result<BoxStream<Result<BoxFuture<Result<RecordBatch>>>>>,
@@ -290,21 +317,15 @@ impl LanceStream {
                         let reader = open_file(
                             file_fragment.fragment,
                             project_schema,
-                            FragReadConfig::default()
-                                .with_row_id(config.with_row_id)
-                                .with_row_address(config.with_row_address)
-                                .with_row_last_updated_at_version(
-                                    config.with_row_last_updated_at_version,
-                                )
-                                .with_row_created_at_version(config.with_row_created_at_version),
-                            config.with_make_deletions_null,
+                            frag_read_config,
+                            with_make_deletions_null,
                             Some((scan_scheduler, priority as u32)),
                         )
                         .await?;
                         let batch_stream = if let Some(range) = file_fragment.range {
-                            reader.read_range(range, config.batch_size as u32)?.boxed()
+                            reader.read_range(range, batch_size as u32)?.boxed()
                         } else {
-                            reader.read_all(config.batch_size as u32)?.boxed()
+                            reader.read_all(batch_size as u32)?.boxed()
                         };
                         let batch_stream: BoxStream<Result<BoxFuture<Result<RecordBatch>>>> =
                             batch_stream
@@ -336,7 +357,7 @@ impl LanceStream {
             // TODO: Ideally this will eventually get tied into datafusion as a # of partitions.  This will let
             // us fully fuse decode into the first half of the plan.  Currently there is likely to be a thread
             // transfer between the two steps.
-            .try_buffered(config.batch_readahead)
+            .try_buffered(batch_readahead)
             .stream_in_current_span()
             .boxed();
 
@@ -375,19 +396,15 @@ impl LanceStream {
             .map(|fragment| FileFragment::new(dataset.clone(), fragment.clone()))
             .collect::<Vec<_>>();
 
+        // Build FragReadConfig once before closures to avoid ownership issues
+        let frag_read_config = build_frag_read_config(&config);
         let batches = if config.ordered_output {
             let readers = stream::iter(file_fragments)
                 .map(move |file_fragment| {
                     Ok(open_file(
                         file_fragment,
                         project_schema.clone(),
-                        FragReadConfig::default()
-                            .with_row_id(config.with_row_id)
-                            .with_row_address(config.with_row_address)
-                            .with_row_last_updated_at_version(
-                                config.with_row_last_updated_at_version,
-                            )
-                            .with_row_created_at_version(config.with_row_created_at_version),
+                        frag_read_config.clone(),
                         config.with_make_deletions_null,
                         None,
                     ))
@@ -414,13 +431,7 @@ impl LanceStream {
                     Ok(open_file(
                         file_fragment,
                         project_schema.clone(),
-                        FragReadConfig::default()
-                            .with_row_id(config.with_row_id)
-                            .with_row_address(config.with_row_address)
-                            .with_row_last_updated_at_version(
-                                config.with_row_last_updated_at_version,
-                            )
-                            .with_row_created_at_version(config.with_row_created_at_version),
+                        frag_read_config.clone(),
                         config.with_make_deletions_null,
                         None,
                     ))
