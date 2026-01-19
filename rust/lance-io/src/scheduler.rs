@@ -283,18 +283,41 @@ impl IoQueue {
         }
     }
 
-    fn push(&self, task: IoTask) {
+    /// Push a task to the I/O queue, waiting if backpressure is exceeded.
+    ///
+    /// This will block if the queue has exceeded its byte budget until
+    /// bytes are consumed by the decoder. This provides backpressure to
+    /// prevent unbounded memory growth during scans.
+    async fn push(&self, task: IoTask) {
+        let num_bytes = task.num_bytes() as i64;
         log::trace!(
             "Inserting I/O request for {} bytes with priority ({},{}) into I/O queue",
-            task.num_bytes(),
+            num_bytes,
             task.priority >> 64,
             task.priority & 0xFFFFFFFFFFFFFFFF
         );
-        let mut state = self.state.lock().unwrap();
-        state.pending_requests.push(task);
-        drop(state);
 
-        self.notify.notify_one();
+        loop {
+            {
+                let mut state = self.state.lock().unwrap();
+
+                // We can push if:
+                // 1. We have enough buffer space, OR
+                // 2. The queue is empty (to avoid deadlock when a single request exceeds buffer)
+                if state.bytes_avail >= num_bytes || state.pending_requests.is_empty() {
+                    state.pending_requests.push(task);
+                    drop(state);
+                    self.notify.notify_one();
+                    return;
+                }
+
+                // Log backpressure warning if needed
+                state.warn_if_needed();
+            }
+
+            // Wait for bytes to be consumed before trying again
+            self.notify.notified().await;
+        }
     }
 
     async fn pop(&self) -> Option<IoTask> {
@@ -366,10 +389,18 @@ struct MutableBatch<F: FnOnce(Response) + Send> {
     priority: u128,
     num_reqs: usize,
     err: Option<Box<dyn std::error::Error + Send + Sync + 'static>>,
+    // IoQueue reference for calling on_bytes_consumed when I/O completes
+    io_queue: Arc<IoQueue>,
 }
 
 impl<F: FnOnce(Response) + Send> MutableBatch<F> {
-    fn new(when_done: F, num_data_buffers: u32, priority: u128, num_reqs: usize) -> Self {
+    fn new(
+        when_done: F,
+        num_data_buffers: u32,
+        priority: u128,
+        num_reqs: usize,
+        io_queue: Arc<IoQueue>,
+    ) -> Self {
         Self {
             when_done: Some(when_done),
             data_buffers: vec![Bytes::default(); num_data_buffers as usize],
@@ -377,6 +408,7 @@ impl<F: FnOnce(Response) + Send> MutableBatch<F> {
             priority,
             num_reqs,
             err: None,
+            io_queue,
         }
     }
 }
@@ -398,14 +430,16 @@ impl<F: FnOnce(Response) + Send> Drop for MutableBatch<F> {
             std::mem::swap(&mut data, &mut self.data_buffers);
             Ok(data)
         };
+
+        // Restore bytes budget now that I/O is complete.
+        // This allows backpressure to release blocked push() calls immediately
+        // when I/O finishes, rather than waiting for the consumer to poll the future.
+        self.io_queue
+            .on_bytes_consumed(self.num_bytes, self.priority, self.num_reqs);
+
         // We don't really care if no one is around to receive it, just let
         // the result go out of scope and get cleaned up
-        let response = Response {
-            data: result,
-            num_bytes: self.num_bytes,
-            priority: self.priority,
-            num_reqs: self.num_reqs,
-        };
+        let response = Response { data: result };
         (self.when_done.take().unwrap())(response);
     }
 }
@@ -602,11 +636,10 @@ impl Debug for ScanScheduler {
     }
 }
 
+// Response now only contains data - priority/num_reqs/num_bytes tracking
+// moved to MutableBatch::drop() which calls on_bytes_consumed() directly
 struct Response {
     data: Result<Vec<Bytes>>,
-    priority: u128,
-    num_reqs: usize,
-    num_bytes: u64,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -708,8 +741,8 @@ impl ScanScheduler {
         self.open_file_with_priority(path, 0, file_size_bytes).await
     }
 
-    fn do_submit_request(
-        &self,
+    async fn do_submit_request(
+        io_queue: Arc<IoQueue>,
         reader: Arc<dyn Reader>,
         request: Vec<Range<u64>>,
         tx: oneshot::Sender<Response>,
@@ -727,18 +760,19 @@ impl ScanScheduler {
             num_iops,
             priority,
             request.len(),
+            io_queue.clone(),
         ))));
 
         for (task_idx, iop) in request.into_iter().enumerate() {
             let dest = dest.clone();
-            let io_queue = self.io_queue.clone();
+            let io_queue_clone = io_queue.clone();
             let num_bytes = iop.end - iop.start;
             let task = IoTask {
                 reader: reader.clone(),
                 to_read: iop,
                 priority,
                 when_done: Box::new(move |data| {
-                    io_queue.on_iop_complete();
+                    io_queue_clone.on_iop_complete();
                     let mut dest = dest.lock().unwrap();
                     let chunk = DataChunk {
                         data,
@@ -748,7 +782,8 @@ impl ScanScheduler {
                     dest.deliver_data(chunk);
                 }),
             };
-            self.io_queue.push(task);
+            // Await backpressure - this will block if the I/O buffer is full
+            io_queue.push(task).await;
         }
     }
 
@@ -760,15 +795,24 @@ impl ScanScheduler {
     ) -> impl Future<Output = Result<Vec<Bytes>>> + Send {
         let (tx, rx) = oneshot::channel::<Response>();
 
-        self.do_submit_request(reader, request, tx, priority);
-
         let io_queue = self.io_queue.clone();
 
+        // Spawn the scheduling work as an async task so it can await backpressure
+        tokio::spawn(Self::do_submit_request(
+            io_queue,
+            reader,
+            request,
+            tx,
+            priority,
+        ));
+
+        // Note: on_bytes_consumed() is called in MutableBatch::drop() when I/O completes,
+        // not here when the future is polled. This avoids deadlock when submitting many
+        // requests before polling any futures.
         rx.map(move |wrapped_rsp| {
             // Right now, it isn't possible for I/O to be cancelled so a cancel error should
             // not occur
             let rsp = wrapped_rsp.unwrap();
-            io_queue.on_bytes_consumed(rsp.num_bytes, rsp.priority, rsp.num_reqs);
             rsp.data
         })
     }
