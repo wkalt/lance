@@ -886,6 +886,7 @@ impl FileReader {
             decoder_plugins,
             io,
             decoder_config,
+            decode_channel_capacity: None,
         };
 
         let requested_rows = RequestedRows::Ranges(vec![range]);
@@ -949,6 +950,7 @@ impl FileReader {
             decoder_plugins,
             io,
             decoder_config,
+            decode_channel_capacity: None,
         };
 
         let requested_rows = RequestedRows::Indices(indices);
@@ -1012,6 +1014,7 @@ impl FileReader {
             decoder_plugins,
             io,
             decoder_config,
+            decode_channel_capacity: None,
         };
 
         let requested_rows = RequestedRows::Ranges(ranges);
@@ -1196,6 +1199,7 @@ impl FileReader {
             decoder_plugins: self.decoder_plugins.clone(),
             io: self.scheduler.clone(),
             decoder_config: self.options.decoder_config.clone(),
+            decode_channel_capacity: None,
         };
 
         let requested_rows = RequestedRows::Indices(indices);
@@ -1235,6 +1239,7 @@ impl FileReader {
             decoder_plugins: self.decoder_plugins.clone(),
             io: self.scheduler.clone(),
             decoder_config: self.options.decoder_config.clone(),
+            decode_channel_capacity: None,
         };
 
         let requested_rows = RequestedRows::Ranges(ranges);
@@ -1274,6 +1279,7 @@ impl FileReader {
             decoder_plugins: self.decoder_plugins.clone(),
             io: self.scheduler.clone(),
             decoder_config: self.options.decoder_config.clone(),
+            decode_channel_capacity: None,
         };
 
         let requested_rows = RequestedRows::Ranges(vec![range]);

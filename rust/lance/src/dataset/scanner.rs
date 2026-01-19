@@ -3291,6 +3291,7 @@ impl Scanner {
             with_row_created_at_version,
             with_make_deletions_null,
             ordered_output: ordered,
+            decode_channel_capacity: None,
         };
         Arc::new(LanceScanExec::new(
             self.dataset.clone(),

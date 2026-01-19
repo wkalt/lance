@@ -1284,6 +1284,36 @@ impl DecodeBatchScheduler {
         self.schedule_ranges(&ranges, filter, sink, scheduler)
     }
 
+    /// Schedules ranges and sends messages to a bounded channel.
+    ///
+    /// This collects all scheduled messages first (firing I/O synchronously),
+    /// then sends them with backpressure. This limits memory accumulation in
+    /// the channel while allowing I/O to proceed optimally.
+    pub fn schedule_ranges_bounded(
+        &mut self,
+        ranges: &[Range<u64>],
+        filter: &FilterExpression,
+        scheduler: Arc<dyn EncodingsIo>,
+    ) -> Vec<Result<DecoderMessage>> {
+        self.schedule_ranges_to_vec(ranges, filter, scheduler, None)
+            .map(|msgs| msgs.into_iter().map(Ok).collect())
+            .unwrap_or_else(|e| vec![Err(e)])
+    }
+
+    /// Schedules indices and returns messages for bounded channel sending.
+    pub fn schedule_take_bounded(
+        &mut self,
+        indices: &[u64],
+        filter: &FilterExpression,
+        scheduler: Arc<dyn EncodingsIo>,
+    ) -> Vec<Result<DecoderMessage>> {
+        if indices.is_empty() {
+            return vec![];
+        }
+        let ranges = Self::indices_to_ranges(indices);
+        self.schedule_ranges_bounded(&ranges, filter, scheduler)
+    }
+
     // coalesce continuous indices if possible (the input indices must be sorted and non-empty)
     fn indices_to_ranges(indices: &[u64]) -> Vec<Range<u64>> {
         let mut ranges = Vec::new();
@@ -1335,8 +1365,32 @@ impl BatchDecodeStream {
         num_rows: u64,
         root_decoder: SimpleStructDecoder,
     ) -> Self {
+        Self::with_context(DecoderContext::new(scheduled), rows_per_batch, num_rows, root_decoder)
+    }
+
+    /// Create a new instance with a bounded receiver for backpressure support
+    pub fn new_bounded(
+        scheduled: mpsc::Receiver<Result<DecoderMessage>>,
+        rows_per_batch: u32,
+        num_rows: u64,
+        root_decoder: SimpleStructDecoder,
+    ) -> Self {
+        Self::with_context(
+            DecoderContext::new_bounded(scheduled),
+            rows_per_batch,
+            num_rows,
+            root_decoder,
+        )
+    }
+
+    fn with_context(
+        context: DecoderContext,
+        rows_per_batch: u32,
+        num_rows: u64,
+        root_decoder: SimpleStructDecoder,
+    ) -> Self {
         Self {
-            context: DecoderContext::new(scheduled),
+            context,
             root_decoder,
             rows_remaining: num_rows,
             rows_per_batch,
@@ -1681,8 +1735,32 @@ impl StructuralBatchDecodeStream {
         num_rows: u64,
         root_decoder: StructuralStructDecoder,
     ) -> Self {
+        Self::with_context(DecoderContext::new(scheduled), rows_per_batch, num_rows, root_decoder)
+    }
+
+    /// Create a new instance with a bounded receiver for backpressure support
+    pub fn new_bounded(
+        scheduled: mpsc::Receiver<Result<DecoderMessage>>,
+        rows_per_batch: u32,
+        num_rows: u64,
+        root_decoder: StructuralStructDecoder,
+    ) -> Self {
+        Self::with_context(
+            DecoderContext::new_bounded(scheduled),
+            rows_per_batch,
+            num_rows,
+            root_decoder,
+        )
+    }
+
+    fn with_context(
+        context: DecoderContext,
+        rows_per_batch: u32,
+        num_rows: u64,
+        root_decoder: StructuralStructDecoder,
+    ) -> Self {
         Self {
-            context: DecoderContext::new(scheduled),
+            context,
             root_decoder,
             rows_remaining: num_rows,
             rows_per_batch,
@@ -1833,6 +1911,13 @@ pub struct SchedulerDecoderConfig {
     pub cache: Arc<LanceCache>,
     /// Decoder configuration
     pub decoder_config: DecoderConfig,
+    /// Capacity of the channel between scheduler and decoder.
+    /// If None, uses an unbounded channel (legacy behavior).
+    /// Using a bounded channel creates backpressure on the scheduler,
+    /// preventing it from running too far ahead of the decoder.
+    /// This reduces memory consumption during scans.
+    /// Recommended value: 2-4 (matching batch_readahead).
+    pub decode_channel_capacity: Option<usize>,
 }
 
 fn check_scheduler_on_drop(
@@ -1877,6 +1962,34 @@ pub fn create_decode_stream(
 
         let simple_struct_decoder = SimpleStructDecoder::new(root_fields, num_rows);
         BatchDecodeStream::new(rx, batch_size, num_rows, simple_struct_decoder).into_stream()
+    }
+}
+
+/// Creates a decode stream with a bounded receiver for backpressure support
+pub fn create_decode_stream_bounded(
+    schema: &Schema,
+    num_rows: u64,
+    batch_size: u32,
+    is_structural: bool,
+    should_validate: bool,
+    rx: mpsc::Receiver<Result<DecoderMessage>>,
+) -> BoxStream<'static, ReadBatchTask> {
+    if is_structural {
+        let arrow_schema = ArrowSchema::from(schema);
+        let structural_decoder = StructuralStructDecoder::new(
+            arrow_schema.fields,
+            should_validate,
+            /*is_root=*/ true,
+        );
+        StructuralBatchDecodeStream::new_bounded(rx, batch_size, num_rows, structural_decoder)
+            .into_stream()
+    } else {
+        let arrow_schema = ArrowSchema::from(schema);
+        let root_fields = arrow_schema.fields;
+
+        let simple_struct_decoder = SimpleStructDecoder::new(root_fields, num_rows);
+        BatchDecodeStream::new_bounded(rx, batch_size, num_rows, simple_struct_decoder)
+            .into_stream()
     }
 }
 
@@ -1927,6 +2040,43 @@ fn create_scheduler_decoder(
 
     let is_structural = column_infos[0].is_structural();
 
+    // Use bounded channel if capacity is specified, otherwise use unbounded (legacy behavior)
+    if let Some(capacity) = config.decode_channel_capacity {
+        create_scheduler_decoder_bounded(
+            column_infos,
+            requested_rows,
+            filter,
+            column_indices,
+            target_schema,
+            config,
+            is_structural,
+            num_rows,
+            capacity,
+        )
+    } else {
+        create_scheduler_decoder_unbounded(
+            column_infos,
+            requested_rows,
+            filter,
+            column_indices,
+            target_schema,
+            config,
+            is_structural,
+            num_rows,
+        )
+    }
+}
+
+fn create_scheduler_decoder_unbounded(
+    column_infos: Vec<Arc<ColumnInfo>>,
+    requested_rows: RequestedRows,
+    filter: FilterExpression,
+    column_indices: Vec<u32>,
+    target_schema: Arc<Schema>,
+    config: SchedulerDecoderConfig,
+    is_structural: bool,
+    num_rows: u64,
+) -> Result<BoxStream<'static, ReadBatchTask>> {
     let (tx, rx) = mpsc::unbounded_channel();
 
     let decode_stream = create_decode_stream(
@@ -1966,6 +2116,75 @@ fn create_scheduler_decoder(
             }
             RequestedRows::Indices(indices) => {
                 decode_scheduler.schedule_take(&indices, &filter, tx, config.io)
+            }
+        }
+    });
+
+    Ok(check_scheduler_on_drop(decode_stream, scheduler_handle))
+}
+
+fn create_scheduler_decoder_bounded(
+    column_infos: Vec<Arc<ColumnInfo>>,
+    requested_rows: RequestedRows,
+    filter: FilterExpression,
+    column_indices: Vec<u32>,
+    target_schema: Arc<Schema>,
+    config: SchedulerDecoderConfig,
+    is_structural: bool,
+    num_rows: u64,
+    channel_capacity: usize,
+) -> Result<BoxStream<'static, ReadBatchTask>> {
+    let (tx, rx) = mpsc::channel(channel_capacity);
+
+    let decode_stream = create_decode_stream_bounded(
+        &target_schema,
+        num_rows,
+        config.batch_size,
+        is_structural,
+        config.decoder_config.validate_on_decode,
+        rx,
+    );
+
+    let scheduler_handle = tokio::task::spawn(async move {
+        let mut decode_scheduler = match DecodeBatchScheduler::try_new(
+            target_schema.as_ref(),
+            &column_indices,
+            &column_infos,
+            &vec![],
+            num_rows,
+            config.decoder_plugins,
+            config.io.clone(),
+            config.cache,
+            &filter,
+            &config.decoder_config,
+        )
+        .await
+        {
+            Ok(scheduler) => scheduler,
+            Err(e) => {
+                let _ = tx.send(Err(e)).await;
+                return;
+            }
+        };
+
+        // Collect all messages synchronously (fires I/O), then send with backpressure.
+        // This limits channel accumulation while allowing I/O to proceed optimally.
+        let messages = match requested_rows {
+            RequestedRows::Ranges(ranges) => {
+                decode_scheduler.schedule_ranges_bounded(&ranges, &filter, config.io)
+            }
+            RequestedRows::Indices(indices) => {
+                decode_scheduler.schedule_take_bounded(&indices, &filter, config.io)
+            }
+        };
+
+        // Send messages with backpressure
+        for msg in messages {
+            if tx.send(msg).await.is_err() {
+                debug!(
+                    "create_scheduler_decoder_bounded aborting early since decoder appears to have been dropped"
+                );
+                return;
             }
         }
     });
@@ -2523,13 +2742,36 @@ pub struct DecoderMessage {
     pub decoders: Vec<MessageType>,
 }
 
+/// A receiver for decoder messages that can be either bounded or unbounded.
+pub enum DecoderReceiver {
+    Bounded(mpsc::Receiver<Result<DecoderMessage>>),
+    Unbounded(mpsc::UnboundedReceiver<Result<DecoderMessage>>),
+}
+
+impl DecoderReceiver {
+    pub async fn recv(&mut self) -> Option<Result<DecoderMessage>> {
+        match self {
+            Self::Bounded(rx) => rx.recv().await,
+            Self::Unbounded(rx) => rx.recv().await,
+        }
+    }
+}
+
 pub struct DecoderContext {
-    source: mpsc::UnboundedReceiver<Result<DecoderMessage>>,
+    source: DecoderReceiver,
 }
 
 impl DecoderContext {
     pub fn new(source: mpsc::UnboundedReceiver<Result<DecoderMessage>>) -> Self {
-        Self { source }
+        Self {
+            source: DecoderReceiver::Unbounded(source),
+        }
+    }
+
+    pub fn new_bounded(source: mpsc::Receiver<Result<DecoderMessage>>) -> Self {
+        Self {
+            source: DecoderReceiver::Bounded(source),
+        }
     }
 }
 

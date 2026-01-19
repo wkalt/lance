@@ -503,6 +503,11 @@ pub struct LanceScanConfig {
     pub with_row_created_at_version: bool,
     pub with_make_deletions_null: bool,
     pub ordered_output: bool,
+    /// Capacity of the channel between scheduler and decoder.
+    /// If None, uses an unbounded channel (legacy behavior).
+    /// Using a bounded channel limits memory accumulation during scans.
+    /// Recommended value: 2-4 (matching batch_readahead).
+    pub decode_channel_capacity: Option<usize>,
 }
 
 // This is mostly for testing purposes, end users are unlikely to create this
@@ -520,6 +525,7 @@ impl Default for LanceScanConfig {
             with_row_created_at_version: false,
             with_make_deletions_null: false,
             ordered_output: false,
+            decode_channel_capacity: None,
         }
     }
 }
