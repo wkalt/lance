@@ -27,39 +27,6 @@ const BACKPRESSURE_MIN: u64 = 5;
 // Don't log backpressure warnings more than once / minute
 const BACKPRESSURE_DEBOUNCE: u64 = 60;
 
-/// A guard that releases I/O budget when dropped.
-///
-/// This is used to track when I/O data is actually consumed by the decoder,
-/// not just when I/O completes. By wrapping returned bytes with this guard,
-/// we ensure backpressure is applied based on actual memory usage.
-struct BytesBudgetGuard {
-    io_queue: Arc<IoQueue>,
-    num_bytes: u64,
-    priority: u128,
-    num_reqs: usize,
-}
-
-impl Drop for BytesBudgetGuard {
-    fn drop(&mut self) {
-        self.io_queue
-            .on_bytes_consumed(self.num_bytes, self.priority, self.num_reqs);
-    }
-}
-
-/// Owner struct for tracked bytes that holds data and a budget guard.
-/// When this is dropped (via Bytes::from_owner), the guard is dropped,
-/// releasing the I/O budget.
-struct TrackedBytesOwner {
-    data: Vec<u8>,
-    _guard: Arc<BytesBudgetGuard>,
-}
-
-impl AsRef<[u8]> for TrackedBytesOwner {
-    fn as_ref(&self) -> &[u8] {
-        &self.data
-    }
-}
-
 // Global counter of how many IOPS we have issued
 static IOPS_COUNTER: AtomicU64 = AtomicU64::new(0);
 // Global counter of how many bytes were read by the scheduler
@@ -452,43 +419,20 @@ impl<F: FnOnce(Response) + Send> MutableBatch<F> {
 // data.
 impl<F: FnOnce(Response) + Send> Drop for MutableBatch<F> {
     fn drop(&mut self) {
+        // Release the I/O budget now that I/O is complete
+        self.io_queue
+            .on_bytes_consumed(self.num_bytes, self.priority, self.num_reqs);
+
         // If we have an error, return that.  Otherwise return the data
         let result = if self.err.is_some() {
-            // On error, release budget immediately since there's no data to track
-            self.io_queue
-                .on_bytes_consumed(self.num_bytes, self.priority, self.num_reqs);
             Err(Error::Wrapped {
                 error: self.err.take().unwrap(),
                 location: location!(),
             })
         } else {
-            // Create a budget guard that will release bytes when all tracked data is dropped.
-            // This ensures backpressure is based on actual data consumption by the decoder,
-            // not just I/O completion. The guard is shared across all returned Bytes via Arc.
-            let guard = Arc::new(BytesBudgetGuard {
-                io_queue: self.io_queue.clone(),
-                num_bytes: self.num_bytes,
-                priority: self.priority,
-                num_reqs: self.num_reqs,
-            });
-
             let mut data = Vec::new();
             std::mem::swap(&mut data, &mut self.data_buffers);
-
-            // Wrap each Bytes with the budget guard so budget is released
-            // when the decoder finishes with the data, not when I/O completes.
-            let tracked_data: Vec<Bytes> = data
-                .into_iter()
-                .map(|bytes| {
-                    let owner = TrackedBytesOwner {
-                        data: bytes.to_vec(),
-                        _guard: guard.clone(),
-                    };
-                    Bytes::from_owner(owner)
-                })
-                .collect();
-
-            Ok(tracked_data)
+            Ok(data)
         };
 
         // We don't really care if no one is around to receive it, just let
