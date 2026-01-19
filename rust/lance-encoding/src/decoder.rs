@@ -2167,24 +2167,43 @@ fn create_scheduler_decoder_bounded(
             }
         };
 
-        // Collect all messages synchronously (fires I/O), then send with backpressure.
-        // This limits channel accumulation while allowing I/O to proceed optimally.
-        let messages = match requested_rows {
+        // Schedule ranges incrementally with backpressure between each range.
+        // This ensures we don't fire all I/O upfront, allowing the decode channel
+        // capacity to actually limit memory consumption.
+        match requested_rows {
             RequestedRows::Ranges(ranges) => {
-                decode_scheduler.schedule_ranges_bounded(&ranges, &filter, config.io)
+                // Schedule one range at a time to limit I/O in flight
+                for range in ranges {
+                    let messages = decode_scheduler
+                        .schedule_ranges_to_vec(&[range.clone()], &filter, config.io.clone(), None)
+                        .map(|msgs| msgs.into_iter().map(Ok).collect::<Vec<_>>())
+                        .unwrap_or_else(|e| vec![Err(e)]);
+                    for msg in messages {
+                        if tx.send(msg).await.is_err() {
+                            debug!(
+                                "create_scheduler_decoder_bounded aborting early since decoder appears to have been dropped"
+                            );
+                            return;
+                        }
+                    }
+                }
             }
             RequestedRows::Indices(indices) => {
-                decode_scheduler.schedule_take_bounded(&indices, &filter, config.io)
-            }
-        };
-
-        // Send messages with backpressure
-        for msg in messages {
-            if tx.send(msg).await.is_err() {
-                debug!(
-                    "create_scheduler_decoder_bounded aborting early since decoder appears to have been dropped"
-                );
-                return;
+                // For indices, chunk them to limit I/O in flight
+                // Use batch_size as chunk size for reasonable granularity
+                let chunk_size = config.batch_size as usize;
+                for chunk in indices.chunks(chunk_size) {
+                    // schedule_take_bounded converts indices to ranges internally
+                    let messages = decode_scheduler.schedule_take_bounded(chunk, &filter, config.io.clone());
+                    for msg in messages {
+                        if tx.send(msg).await.is_err() {
+                            debug!(
+                                "create_scheduler_decoder_bounded aborting early since decoder appears to have been dropped"
+                            );
+                            return;
+                        }
+                    }
+                }
             }
         }
     });
