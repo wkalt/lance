@@ -231,6 +231,7 @@ use log::{debug, trace, warn};
 use snafu::location;
 use tokio::sync::mpsc::error::SendError;
 use tokio::sync::mpsc::{self, unbounded_channel};
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
 use lance_core::{ArrowResult, Error, Result};
 use tracing::instrument;
@@ -1090,6 +1091,7 @@ impl DecodeBatchScheduler {
                 if !schedule_action(Ok(DecoderMessage {
                     scheduled_so_far: num_rows_scheduled,
                     decoders: next_scan_line.decoders,
+                    backpressure_permit: None,
                 })) {
                     // Decoder has disconnected
                     return;
@@ -1152,6 +1154,7 @@ impl DecodeBatchScheduler {
             if !schedule_action(Ok(DecoderMessage {
                 scheduled_so_far: num_rows_scheduled,
                 decoders: next_scan_line.decoders,
+                backpressure_permit: None,
             })) {
                 // Decoder has disconnected
                 return;
@@ -2134,9 +2137,20 @@ fn create_scheduler_decoder_bounded(
     num_rows: u64,
     channel_capacity: usize,
 ) -> Result<BoxStream<'static, ReadBatchTask>> {
-    let (tx, rx) = mpsc::channel(channel_capacity);
+    // Use semaphore-based backpressure instead of bounded channels.
+    // This approach:
+    // 1. Acquires a permit BEFORE sending each message (pure async, no blocking)
+    // 2. Attaches the permit to the message (released when message is processed)
+    // 3. Uses an unbounded channel (simpler, no blocking send)
+    //
+    // Benefits over bounded channels:
+    // - No futex/condvar waits under concurrent load
+    // - Backpressure is async (semaphore.acquire().await) not blocking
+    // - Permits are released when messages are PROCESSED, not just received
+    let backpressure_semaphore = Arc::new(Semaphore::new(channel_capacity));
+    let (tx, rx) = mpsc::unbounded_channel();
 
-    let decode_stream = create_decode_stream_bounded(
+    let decode_stream = create_decode_stream(
         &target_schema,
         num_rows,
         config.batch_size,
@@ -2162,14 +2176,14 @@ fn create_scheduler_decoder_bounded(
         {
             Ok(scheduler) => scheduler,
             Err(e) => {
-                let _ = tx.send(Err(e)).await;
+                let _ = tx.send(Err(e));
                 return;
             }
         };
 
-        // Schedule ranges incrementally with backpressure between each range.
-        // This ensures we don't fire all I/O upfront, allowing the decode channel
-        // capacity to actually limit memory consumption.
+        // Schedule ranges incrementally with backpressure via semaphore.
+        // Acquiring a permit before scheduling ensures we don't have too many
+        // messages in flight, which limits memory consumption.
         match requested_rows {
             RequestedRows::Ranges(ranges) => {
                 // Schedule one range at a time to limit I/O in flight
@@ -2179,7 +2193,26 @@ fn create_scheduler_decoder_bounded(
                         .map(|msgs| msgs.into_iter().map(Ok).collect::<Vec<_>>())
                         .unwrap_or_else(|e| vec![Err(e)]);
                     for msg in messages {
-                        if tx.send(msg).await.is_err() {
+                        // Acquire permit before sending - this awaits if too many messages in flight
+                        let permit = match backpressure_semaphore.clone().acquire_owned().await {
+                            Ok(permit) => Some(permit),
+                            Err(_) => {
+                                // Semaphore closed - decoder must have been dropped
+                                debug!(
+                                    "create_scheduler_decoder_bounded aborting early since semaphore was closed"
+                                );
+                                return;
+                            }
+                        };
+
+                        // Attach permit to message - released when message is dropped after processing
+                        let msg_with_permit = msg.map(|m| DecoderMessage {
+                            scheduled_so_far: m.scheduled_so_far,
+                            decoders: m.decoders,
+                            backpressure_permit: permit,
+                        });
+
+                        if tx.send(msg_with_permit).is_err() {
                             debug!(
                                 "create_scheduler_decoder_bounded aborting early since decoder appears to have been dropped"
                             );
@@ -2196,7 +2229,26 @@ fn create_scheduler_decoder_bounded(
                     // schedule_take_bounded converts indices to ranges internally
                     let messages = decode_scheduler.schedule_take_bounded(chunk, &filter, config.io.clone());
                     for msg in messages {
-                        if tx.send(msg).await.is_err() {
+                        // Acquire permit before sending - this awaits if too many messages in flight
+                        let permit = match backpressure_semaphore.clone().acquire_owned().await {
+                            Ok(permit) => Some(permit),
+                            Err(_) => {
+                                // Semaphore closed - decoder must have been dropped
+                                debug!(
+                                    "create_scheduler_decoder_bounded aborting early since semaphore was closed"
+                                );
+                                return;
+                            }
+                        };
+
+                        // Attach permit to message - released when message is dropped after processing
+                        let msg_with_permit = msg.map(|m| DecoderMessage {
+                            scheduled_so_far: m.scheduled_so_far,
+                            decoders: m.decoders,
+                            backpressure_permit: permit,
+                        });
+
+                        if tx.send(msg_with_permit).is_err() {
                             debug!(
                                 "create_scheduler_decoder_bounded aborting early since decoder appears to have been dropped"
                             );
@@ -2759,6 +2811,11 @@ impl MessageType {
 pub struct DecoderMessage {
     pub scheduled_so_far: u64,
     pub decoders: Vec<MessageType>,
+    /// Backpressure permit - when present, released when message is dropped (after processing).
+    /// This provides automatic backpressure: the scheduler acquires a permit before sending,
+    /// and the permit is released when the decoded batch is consumed.
+    #[allow(dead_code)]
+    pub backpressure_permit: Option<OwnedSemaphorePermit>,
 }
 
 /// A receiver for decoder messages that can be either bounded or unbounded.
