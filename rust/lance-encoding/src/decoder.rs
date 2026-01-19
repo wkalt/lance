@@ -222,7 +222,9 @@ use arrow_schema::{ArrowError, DataType, Field as ArrowField, Fields, Schema as 
 use bytes::Bytes;
 use futures::future::{maybe_done, BoxFuture, MaybeDone};
 use futures::stream::{self, BoxStream};
-use futures::{FutureExt, StreamExt};
+use futures::{FutureExt, Stream, StreamExt};
+use std::pin::Pin;
+use std::task::{Context, Poll};
 use lance_arrow::DataTypeExt;
 use lance_core::cache::LanceCache;
 use lance_core::datatypes::{Field, Schema, BLOB_DESC_LANCE_FIELD};
@@ -2126,6 +2128,29 @@ fn create_scheduler_decoder_unbounded(
     Ok(check_scheduler_on_drop(decode_stream, scheduler_handle))
 }
 
+/// A wrapper around a decode stream that closes the backpressure semaphore when dropped.
+/// This ensures the scheduler task can exit cleanly when the decoder is done or dropped.
+struct BoundedDecodeStream {
+    inner: BoxStream<'static, ReadBatchTask>,
+    semaphore: Arc<Semaphore>,
+}
+
+impl Stream for BoundedDecodeStream {
+    type Item = ReadBatchTask;
+
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        self.inner.as_mut().poll_next(cx)
+    }
+}
+
+impl Drop for BoundedDecodeStream {
+    fn drop(&mut self) {
+        // Close the semaphore to unblock the scheduler if it's waiting for permits.
+        // This allows the scheduler task to exit cleanly.
+        self.semaphore.close();
+    }
+}
+
 fn create_scheduler_decoder_bounded(
     column_infos: Vec<Arc<ColumnInfo>>,
     requested_rows: RequestedRows,
@@ -2147,7 +2172,11 @@ fn create_scheduler_decoder_bounded(
     // - No futex/condvar waits under concurrent load
     // - Backpressure is async (semaphore.acquire().await) not blocking
     // - Permits are released when messages are PROCESSED, not just received
+    //
+    // The semaphore is closed when the decode stream is dropped, which allows
+    // the scheduler to exit cleanly even if it's blocked waiting for permits.
     let backpressure_semaphore = Arc::new(Semaphore::new(channel_capacity));
+    let scheduler_semaphore = backpressure_semaphore.clone();
     let (tx, rx) = mpsc::unbounded_channel();
 
     let decode_stream = create_decode_stream(
@@ -2194,7 +2223,7 @@ fn create_scheduler_decoder_bounded(
                         .unwrap_or_else(|e| vec![Err(e)]);
                     for msg in messages {
                         // Acquire permit before sending - this awaits if too many messages in flight
-                        let permit = match backpressure_semaphore.clone().acquire_owned().await {
+                        let permit = match scheduler_semaphore.clone().acquire_owned().await {
                             Ok(permit) => Some(permit),
                             Err(_) => {
                                 // Semaphore closed - decoder must have been dropped
@@ -2230,7 +2259,7 @@ fn create_scheduler_decoder_bounded(
                     let messages = decode_scheduler.schedule_take_bounded(chunk, &filter, config.io.clone());
                     for msg in messages {
                         // Acquire permit before sending - this awaits if too many messages in flight
-                        let permit = match backpressure_semaphore.clone().acquire_owned().await {
+                        let permit = match scheduler_semaphore.clone().acquire_owned().await {
                             Ok(permit) => Some(permit),
                             Err(_) => {
                                 // Semaphore closed - decoder must have been dropped
@@ -2260,7 +2289,12 @@ fn create_scheduler_decoder_bounded(
         }
     });
 
-    Ok(check_scheduler_on_drop(decode_stream, scheduler_handle))
+    let inner_stream = check_scheduler_on_drop(decode_stream, scheduler_handle);
+    Ok(BoundedDecodeStream {
+        inner: inner_stream,
+        semaphore: backpressure_semaphore,
+    }
+    .boxed())
 }
 
 /// Launches a scheduler on a dedicated (spawned) task and creates a decoder to
