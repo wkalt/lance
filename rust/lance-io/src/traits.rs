@@ -12,6 +12,21 @@ use tokio::io::{AsyncWrite, AsyncWriteExt};
 
 use lance_core::Result;
 
+/// A trait for checking if data is cached without reading it.
+///
+/// This trait can be implemented by caching object stores to indicate
+/// whether a range of bytes is already in cache. When data is cached,
+/// the I/O scheduler can return lazy futures that read on demand rather
+/// than eagerly spawning I/O tasks.
+#[async_trait]
+pub trait CacheChecker: std::fmt::Debug + Send + Sync {
+    /// Check if a range of bytes for a given path is cached.
+    ///
+    /// Returns true if all bytes in the range are cached and can be
+    /// read without going through the I/O loop.
+    async fn is_range_cached(&self, location: &Path, range: Range<u64>) -> bool;
+}
+
 pub trait ProtoStruct {
     type Proto: Message;
 }
@@ -102,4 +117,14 @@ pub trait Reader: std::fmt::Debug + Send + Sync + DeepSizeOf {
     /// By default this reads the size in a separate IOP but some implementations
     /// may not need the size beforehand.
     async fn get_all(&self) -> object_store::Result<Bytes>;
+
+    /// Check if a range of bytes is cached and can be read lazily.
+    ///
+    /// When this returns true, the scheduler may bypass the I/O queue and
+    /// return a lazy future that reads directly from the cache on demand.
+    ///
+    /// By default, returns false (assume not cached).
+    async fn is_range_cached(&self, _range: Range<usize>) -> bool {
+        false
+    }
 }
