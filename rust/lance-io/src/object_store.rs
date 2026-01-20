@@ -132,6 +132,8 @@ pub struct ObjectStore {
     /// which usually cannot be found in the URL such as Azure account name. The prefix plus the
     /// path uniquely identifies any object inside the store.
     pub store_prefix: String,
+    /// Optional cache checker for lazy I/O optimization
+    cache_checker: Option<Arc<dyn crate::traits::CacheChecker>>,
 }
 
 impl DeepSizeOf for ObjectStore {
@@ -156,6 +158,18 @@ pub trait WrappingObjectStore: std::fmt::Debug + Send + Sync {
     /// The store_prefix is a string which uniquely identifies the object
     /// store being wrapped.
     fn wrap(&self, store_prefix: &str, original: Arc<dyn OSObjectStore>) -> Arc<dyn OSObjectStore>;
+
+    /// Get a cache checker for the wrapped store, if caching is supported.
+    ///
+    /// This is used by the I/O scheduler to determine if data is cached
+    /// and can be read lazily (bypassing the I/O queue).
+    fn cache_checker(
+        &self,
+        _store_prefix: &str,
+        _wrapped: Arc<dyn OSObjectStore>,
+    ) -> Option<Arc<dyn crate::traits::CacheChecker>> {
+        None
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -429,9 +443,12 @@ impl ObjectStore {
             let mut inner = store.clone();
             let store_prefix =
                 registry.calculate_object_store_prefix(uri, params.storage_options())?;
-            if let Some(wrapper) = params.object_store_wrapper.as_ref() {
-                inner = wrapper.wrap(&store_prefix, inner);
-            }
+            let cache_checker = if let Some(wrapper) = params.object_store_wrapper.as_ref() {
+                inner = wrapper.wrap(&store_prefix, inner.clone());
+                wrapper.cache_checker(&store_prefix, inner.clone())
+            } else {
+                None
+            };
 
             // Always wrap with IO tracking
             let io_tracker = IOTracker::default();
@@ -448,6 +465,7 @@ impl ObjectStore {
                 download_retry_count: DEFAULT_DOWNLOAD_RETRY_COUNT,
                 io_tracker,
                 store_prefix: String::new(), // custom object store, no prefix needed
+                cache_checker,
             };
             let path = Path::parse(path.path())?;
             return Ok((Arc::new(store), path));
@@ -581,12 +599,13 @@ impl ObjectStore {
                 )
                 .await
             }
-            _ => Ok(Box::new(CloudObjectReader::new(
+            _ => Ok(Box::new(CloudObjectReader::new_with_cache_checker(
                 self.inner.clone(),
                 path.clone(),
                 self.block_size,
                 None,
                 self.download_retry_count,
+                self.cache_checker.clone(),
             )?)),
         }
     }
@@ -618,12 +637,13 @@ impl ObjectStore {
                 )
                 .await
             }
-            _ => Ok(Box::new(CloudObjectReader::new(
+            _ => Ok(Box::new(CloudObjectReader::new_with_cache_checker(
                 self.inner.clone(),
                 path.clone(),
                 self.block_size,
                 Some(known_size),
                 self.download_retry_count,
+                self.cache_checker.clone(),
             )?)),
         }
     }
@@ -882,9 +902,13 @@ impl ObjectStore {
             .calculate_object_store_prefix(location.as_ref(), storage_options)
             .unwrap_or_default();
 
-        let store = match wrapper {
-            Some(wrapper) => wrapper.wrap(&store_prefix, store),
-            None => store,
+        let (store, cache_checker) = match wrapper {
+            Some(wrapper) => {
+                let wrapped = wrapper.wrap(&store_prefix, store.clone());
+                let checker = wrapper.cache_checker(&store_prefix, wrapped.clone());
+                (wrapped, checker)
+            }
+            None => (store, None),
         };
 
         // Always wrap with IO tracking
@@ -902,6 +926,7 @@ impl ObjectStore {
             download_retry_count,
             io_tracker,
             store_prefix,
+            cache_checker,
         }
     }
 }
