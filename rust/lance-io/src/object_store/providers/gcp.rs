@@ -124,6 +124,7 @@ impl ObjectStoreProvider for GcsStoreProvider {
             io_parallelism: DEFAULT_CLOUD_IO_PARALLELISM,
             download_retry_count,
             io_tracker: Default::default(),
+            cache_checker: None,
         })
     }
 }

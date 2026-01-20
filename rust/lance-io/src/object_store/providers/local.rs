@@ -32,6 +32,7 @@ impl ObjectStoreProvider for FileStoreProvider {
             io_parallelism: DEFAULT_LOCAL_IO_PARALLELISM,
             download_retry_count,
             io_tracker: Default::default(),
+            cache_checker: None,
         })
     }
 

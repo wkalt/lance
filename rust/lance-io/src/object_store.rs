@@ -127,6 +127,8 @@ pub struct ObjectStore {
     download_retry_count: usize,
     /// IO tracker for monitoring read/write operations
     io_tracker: IOTracker,
+    /// Optional cache checker for lazy I/O optimization
+    cache_checker: Option<Arc<dyn crate::traits::CacheChecker>>,
 }
 
 impl DeepSizeOf for ObjectStore {
@@ -151,6 +153,18 @@ pub trait WrappingObjectStore: std::fmt::Debug + Send + Sync {
     /// The store_prefix is a string which uniquely identifies the object
     /// store being wrapped.
     fn wrap(&self, store_prefix: &str, original: Arc<dyn OSObjectStore>) -> Arc<dyn OSObjectStore>;
+
+    /// Get a cache checker for the wrapped store, if caching is supported.
+    ///
+    /// This is used by the I/O scheduler to determine if data is cached
+    /// and can be read lazily (bypassing the I/O queue).
+    fn cache_checker(
+        &self,
+        _store_prefix: &str,
+        _wrapped: Arc<dyn OSObjectStore>,
+    ) -> Option<Arc<dyn crate::traits::CacheChecker>> {
+        None
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -411,9 +425,12 @@ impl ObjectStore {
             let mut inner = store.clone();
             let store_prefix =
                 registry.calculate_object_store_prefix(uri, params.storage_options.as_ref())?;
-            if let Some(wrapper) = params.object_store_wrapper.as_ref() {
-                inner = wrapper.wrap(&store_prefix, inner);
-            }
+            let cache_checker = if let Some(wrapper) = params.object_store_wrapper.as_ref() {
+                inner = wrapper.wrap(&store_prefix, inner.clone());
+                wrapper.cache_checker(&store_prefix, inner.clone())
+            } else {
+                None
+            };
 
             // Always wrap with IO tracking
             let io_tracker = IOTracker::default();
@@ -429,6 +446,7 @@ impl ObjectStore {
                 io_parallelism: DEFAULT_CLOUD_IO_PARALLELISM,
                 download_retry_count: DEFAULT_DOWNLOAD_RETRY_COUNT,
                 io_tracker,
+                cache_checker,
             };
             let path = Path::parse(path.path())?;
             return Ok((Arc::new(store), path));
@@ -562,12 +580,13 @@ impl ObjectStore {
                 )
                 .await
             }
-            _ => Ok(Box::new(CloudObjectReader::new(
+            _ => Ok(Box::new(CloudObjectReader::new_with_cache_checker(
                 self.inner.clone(),
                 path.clone(),
                 self.block_size,
                 None,
                 self.download_retry_count,
+                self.cache_checker.clone(),
             )?)),
         }
     }
@@ -599,12 +618,13 @@ impl ObjectStore {
                 )
                 .await
             }
-            _ => Ok(Box::new(CloudObjectReader::new(
+            _ => Ok(Box::new(CloudObjectReader::new_with_cache_checker(
                 self.inner.clone(),
                 path.clone(),
                 self.block_size,
                 Some(known_size),
                 self.download_retry_count,
+                self.cache_checker.clone(),
             )?)),
         }
     }
@@ -859,14 +879,16 @@ impl ObjectStore {
         let scheme = location.scheme();
         let block_size = block_size.unwrap_or_else(|| infer_block_size(scheme));
 
-        let store = match wrapper {
+        let (store, cache_checker) = match wrapper {
             Some(wrapper) => {
                 let store_prefix = DEFAULT_OBJECT_STORE_REGISTRY
                     .calculate_object_store_prefix(location.as_ref(), storage_options)
                     .unwrap();
-                wrapper.wrap(&store_prefix, store)
+                let wrapped = wrapper.wrap(&store_prefix, store.clone());
+                let checker = wrapper.cache_checker(&store_prefix, wrapped.clone());
+                (wrapped, checker)
             }
-            None => store,
+            None => (store, None),
         };
 
         // Always wrap with IO tracking
@@ -883,6 +905,7 @@ impl ObjectStore {
             io_parallelism,
             download_retry_count,
             io_tracker,
+            cache_checker,
         }
     }
 }
