@@ -16,7 +16,7 @@ use object_store::{path::Path, GetOptions, GetResult, ObjectStore, Result as OSR
 use tokio::sync::OnceCell;
 use tracing::instrument;
 
-use crate::{object_store::DEFAULT_CLOUD_IO_PARALLELISM, traits::Reader};
+use crate::{object_store::DEFAULT_CLOUD_IO_PARALLELISM, traits::{CacheChecker, Reader}};
 
 /// Object Reader
 ///
@@ -32,6 +32,9 @@ pub struct CloudObjectReader {
 
     block_size: usize,
     download_retry_count: usize,
+
+    // Optional cache checker for lazy I/O optimization
+    cache_checker: Option<Arc<dyn CacheChecker>>,
 }
 
 impl DeepSizeOf for CloudObjectReader {
@@ -56,6 +59,26 @@ impl CloudObjectReader {
             size: OnceCell::new_with(known_size),
             block_size,
             download_retry_count,
+            cache_checker: None,
+        })
+    }
+
+    /// Create an ObjectReader with an optional cache checker for lazy I/O
+    pub fn new_with_cache_checker(
+        object_store: Arc<dyn ObjectStore>,
+        path: Path,
+        block_size: usize,
+        known_size: Option<usize>,
+        download_retry_count: usize,
+        cache_checker: Option<Arc<dyn CacheChecker>>,
+    ) -> Result<Self> {
+        Ok(Self {
+            object_store,
+            path,
+            size: OnceCell::new_with(known_size),
+            block_size,
+            download_retry_count,
+            cache_checker,
         })
     }
 
@@ -173,6 +196,16 @@ impl Reader for CloudObjectReader {
             || "read_all".to_string(),
         )
         .await
+    }
+
+    async fn is_range_cached(&self, range: Range<usize>) -> bool {
+        if let Some(cache_checker) = &self.cache_checker {
+            cache_checker
+                .is_range_cached(&self.path, range.start as u64..range.end as u64)
+                .await
+        } else {
+            false
+        }
     }
 }
 

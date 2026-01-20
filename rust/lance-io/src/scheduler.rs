@@ -827,62 +827,99 @@ impl FileScheduler {
     /// Each request has a backpressure ID which controls which backpressure throttle
     /// is applied to the request.  Requests made to the same backpressure throttle
     /// will be throttled together.
+    ///
+    /// If the data is cached (as determined by `Reader::is_range_cached`), the read
+    /// will be performed lazily when the future is polled, bypassing the I/O queue.
+    /// This prevents cached data from accumulating in memory before the decoder
+    /// is ready to process it.
     pub fn submit_request(
         &self,
         request: Vec<Range<u64>>,
         priority: u64,
     ) -> impl Future<Output = Result<Vec<Bytes>>> + Send {
-        // The final priority is a combination of the row offset and the file number
-        let priority = ((self.base_priority as u128) << 64) + priority as u128;
-
-        let mut merged_requests = Vec::with_capacity(request.len());
-
-        if !request.is_empty() {
-            let mut curr_interval = request[0].clone();
-
-            for req in request.iter().skip(1) {
-                if is_close_together(&curr_interval, req, self.block_size) {
-                    curr_interval.end = curr_interval.end.max(req.end);
-                } else {
-                    merged_requests.push(curr_interval);
-                    curr_interval = req.clone();
-                }
-            }
-
-            merged_requests.push(curr_interval);
-        }
-
-        let mut updated_requests = Vec::with_capacity(merged_requests.len());
-        for req in merged_requests {
-            if req.is_empty() {
-                updated_requests.push(req);
-            } else {
-                let num_requests = (req.end - req.start).div_ceil(self.max_iop_size);
-                let bytes_per_request = (req.end - req.start) / num_requests;
-                for i in 0..num_requests {
-                    let start = req.start + i * bytes_per_request;
-                    let end = if i == num_requests - 1 {
-                        // Last request is a bit bigger due to rounding
-                        req.end
-                    } else {
-                        start + bytes_per_request
-                    };
-                    updated_requests.push(start..end);
-                }
-            }
-        }
-
-        self.root.stats.record_request(&updated_requests);
-
-        let bytes_vec_fut =
-            self.root
-                .submit_request(self.reader.clone(), updated_requests.clone(), priority);
-
-        let mut updated_index = 0;
-        let mut final_bytes = Vec::with_capacity(request.len());
+        // Clone what we need for the async block
+        let reader = self.reader.clone();
+        let root = self.root.clone();
+        let block_size = self.block_size;
+        let max_iop_size = self.max_iop_size;
+        let base_priority = self.base_priority;
 
         async move {
-            let bytes_vec = bytes_vec_fut.await?;
+            // Check if all ranges are cached - this is a cheap metadata check
+            let mut all_cached = !request.is_empty();
+            for req in &request {
+                if !reader.is_range_cached(req.start as usize..req.end as usize).await {
+                    all_cached = false;
+                    break;
+                }
+            }
+
+            if all_cached {
+                // Data is cached - read directly without going through I/O queue.
+                // This read happens lazily when this future is polled, not eagerly.
+                let mut results = Vec::with_capacity(request.len());
+                for req in &request {
+                    let bytes = reader
+                        .get_range(req.start as usize..req.end as usize)
+                        .await
+                        .map_err(|e| Error::IO {
+                            source: Box::new(e),
+                            location: location!(),
+                        })?;
+                    results.push(bytes);
+                }
+                return Ok(results);
+            }
+
+            // Data not cached - go through normal I/O queue path
+            // The final priority is a combination of the row offset and the file number
+            let priority = ((base_priority as u128) << 64) + priority as u128;
+
+            let mut merged_requests = Vec::with_capacity(request.len());
+
+            if !request.is_empty() {
+                let mut curr_interval = request[0].clone();
+
+                for req in request.iter().skip(1) {
+                    if is_close_together(&curr_interval, req, block_size) {
+                        curr_interval.end = curr_interval.end.max(req.end);
+                    } else {
+                        merged_requests.push(curr_interval);
+                        curr_interval = req.clone();
+                    }
+                }
+
+                merged_requests.push(curr_interval);
+            }
+
+            let mut updated_requests = Vec::with_capacity(merged_requests.len());
+            for req in merged_requests {
+                if req.is_empty() {
+                    updated_requests.push(req);
+                } else {
+                    let num_requests = (req.end - req.start).div_ceil(max_iop_size);
+                    let bytes_per_request = (req.end - req.start) / num_requests;
+                    for i in 0..num_requests {
+                        let start = req.start + i * bytes_per_request;
+                        let end = if i == num_requests - 1 {
+                            // Last request is a bit bigger due to rounding
+                            req.end
+                        } else {
+                            start + bytes_per_request
+                        };
+                        updated_requests.push(start..end);
+                    }
+                }
+            }
+
+            root.stats.record_request(&updated_requests);
+
+            let bytes_vec = root
+                .submit_request(reader.clone(), updated_requests.clone(), priority)
+                .await?;
+
+            let mut updated_index = 0;
+            let mut final_bytes = Vec::with_capacity(request.len());
 
             let mut orig_index = 0;
             while (updated_index < updated_requests.len()) && (orig_index < request.len()) {
