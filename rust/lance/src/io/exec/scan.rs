@@ -336,7 +336,7 @@ impl LanceStream {
             // TODO: Ideally this will eventually get tied into datafusion as a # of partitions.  This will let
             // us fully fuse decode into the first half of the plan.  Currently there is likely to be a thread
             // transfer between the two steps.
-            .try_buffered(get_num_compute_intensive_cpus())
+            .try_buffered(config.batch_readahead)
             .stream_in_current_span()
             .boxed();
 
