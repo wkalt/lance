@@ -1930,12 +1930,15 @@ pub fn create_decode_iterator(
     }
 }
 
-/// A wrapper around a decode stream that closes the backpressure semaphore when dropped.
+/// A wrapper around a decode stream that cancels the scheduler when dropped.
 /// This ensures the scheduler task can exit cleanly when the decoder is done or dropped,
 /// rather than blocking forever waiting for permits.
+///
+/// Instead of closing the shared semaphore (which would break other scans),
+/// we use a cancellation token that only affects this scan's scheduler.
 struct BoundedDecodeStream {
     inner: BoxStream<'static, ReadBatchTask>,
-    semaphore: Arc<Semaphore>,
+    cancel: tokio_util::sync::CancellationToken,
 }
 
 impl Stream for BoundedDecodeStream {
@@ -1948,9 +1951,8 @@ impl Stream for BoundedDecodeStream {
 
 impl Drop for BoundedDecodeStream {
     fn drop(&mut self) {
-        // Close the semaphore to unblock the scheduler if it's waiting for permits.
-        // This allows the scheduler task to exit cleanly.
-        self.semaphore.close();
+        // Signal cancellation so the scheduler can exit if it's waiting for permits.
+        self.cancel.cancel();
     }
 }
 
@@ -1967,6 +1969,9 @@ fn create_scheduler_decoder(
     let is_structural = column_infos[0].is_structural();
 
     let backpressure_semaphore = config.backpressure_semaphore.clone();
+    let cancel_token = backpressure_semaphore
+        .as_ref()
+        .map(|_| tokio_util::sync::CancellationToken::new());
 
     let (tx, rx) = mpsc::unbounded_channel();
 
@@ -1979,6 +1984,7 @@ fn create_scheduler_decoder(
         rx,
     );
 
+    let scheduler_cancel = cancel_token.clone();
     let scheduler_handle = tokio::task::spawn(async move {
         let mut decode_scheduler = match DecodeBatchScheduler::try_new(
             target_schema.as_ref(),
@@ -2002,67 +2008,48 @@ fn create_scheduler_decoder(
         };
 
         if let Some(ref semaphore) = config.backpressure_semaphore {
+            let cancel = scheduler_cancel.expect("cancel token must exist when semaphore is set");
             // Backpressure path: schedule ranges to vec, then send with permits.
             // This ensures the scheduler doesn't race ahead of the decoder when
             // I/O is fast (e.g., cache hits).
-            match requested_rows {
-                RequestedRows::Ranges(ranges) => {
-                    for range in &ranges {
-                        let messages = decode_scheduler
-                            .schedule_ranges_to_vec(std::slice::from_ref(range), &filter, config.io.clone(), None)
-                            .map(|msgs| msgs.into_iter().map(Ok).collect::<Vec<_>>())
-                            .unwrap_or_else(|e| vec![Err(e)]);
-                        for msg in messages {
-                            let permit = match semaphore.clone().acquire_owned().await {
+            let ranges = match requested_rows {
+                RequestedRows::Ranges(ranges) => ranges,
+                RequestedRows::Indices(indices) => {
+                    DecodeBatchScheduler::indices_to_ranges(&indices)
+                }
+            };
+            for range in &ranges {
+                let messages = decode_scheduler
+                    .schedule_ranges_to_vec(std::slice::from_ref(range), &filter, config.io.clone(), None)
+                    .map(|msgs| msgs.into_iter().map(Ok).collect::<Vec<_>>())
+                    .unwrap_or_else(|e| vec![Err(e)]);
+                for msg in messages {
+                    // Wait for either a permit or cancellation (stream dropped).
+                    let permit = tokio::select! {
+                        result = semaphore.clone().acquire_owned() => {
+                            match result {
                                 Ok(permit) => Some(permit),
                                 Err(_) => {
-                                    debug!(
-                                        "create_scheduler_decoder aborting early since semaphore was closed"
-                                    );
+                                    debug!("create_scheduler_decoder aborting: semaphore closed");
                                     return;
                                 }
-                            };
-                            let msg_with_permit = msg.map(|m| DecoderMessage {
-                                scheduled_so_far: m.scheduled_so_far,
-                                decoders: m.decoders,
-                                backpressure_permit: permit,
-                            });
-                            if tx.send(msg_with_permit).is_err() {
-                                debug!(
-                                    "create_scheduler_decoder aborting early since decoder appears to have been dropped"
-                                );
-                                return;
                             }
                         }
-                    }
-                }
-                RequestedRows::Indices(indices) => {
-                    let ranges = DecodeBatchScheduler::indices_to_ranges(&indices);
-                    let messages = decode_scheduler
-                        .schedule_ranges_to_vec(&ranges, &filter, config.io.clone(), None)
-                        .map(|msgs| msgs.into_iter().map(Ok).collect::<Vec<_>>())
-                        .unwrap_or_else(|e| vec![Err(e)]);
-                    for msg in messages {
-                        let permit = match semaphore.clone().acquire_owned().await {
-                            Ok(permit) => Some(permit),
-                            Err(_) => {
-                                debug!(
-                                    "create_scheduler_decoder aborting early since semaphore was closed"
-                                );
-                                return;
-                            }
-                        };
-                        let msg_with_permit = msg.map(|m| DecoderMessage {
-                            scheduled_so_far: m.scheduled_so_far,
-                            decoders: m.decoders,
-                            backpressure_permit: permit,
-                        });
-                        if tx.send(msg_with_permit).is_err() {
-                            debug!(
-                                "create_scheduler_decoder aborting early since decoder appears to have been dropped"
-                            );
+                        _ = cancel.cancelled() => {
+                            debug!("create_scheduler_decoder aborting: scan cancelled");
                             return;
                         }
+                    };
+                    let msg_with_permit = msg.map(|m| DecoderMessage {
+                        scheduled_so_far: m.scheduled_so_far,
+                        decoders: m.decoders,
+                        backpressure_permit: permit,
+                    });
+                    if tx.send(msg_with_permit).is_err() {
+                        debug!(
+                            "create_scheduler_decoder aborting early since decoder appears to have been dropped"
+                        );
+                        return;
                     }
                 }
             }
@@ -2081,10 +2068,10 @@ fn create_scheduler_decoder(
 
     let inner_stream = check_scheduler_on_drop(decode_stream, scheduler_handle);
 
-    if let Some(semaphore) = backpressure_semaphore {
+    if let Some(cancel) = cancel_token {
         Ok(BoundedDecodeStream {
             inner: inner_stream,
-            semaphore,
+            cancel,
         }
         .boxed())
     } else {
