@@ -110,7 +110,7 @@ impl<O: OSObjectStore + ?Sized> ObjectStoreExt for O {
 }
 
 /// Wraps [ObjectStore](object_store::ObjectStore)
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct ObjectStore {
     // Inner object store
     pub inner: Arc<dyn OSObjectStore>,
@@ -132,6 +132,19 @@ pub struct ObjectStore {
     /// which usually cannot be found in the URL such as Azure account name. The prefix plus the
     /// path uniquely identifies any object inside the store.
     pub store_prefix: String,
+    /// Optional function to get segmented byte ranges from a cache without
+    /// stitching multi-page reads into a single buffer.
+    pub segments_fn: Option<crate::object_reader::SegmentsFn>,
+}
+
+impl std::fmt::Debug for ObjectStore {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ObjectStore")
+            .field("scheme", &self.scheme)
+            .field("block_size", &self.block_size)
+            .field("store_prefix", &self.store_prefix)
+            .finish()
+    }
 }
 
 impl DeepSizeOf for ObjectStore {
@@ -156,6 +169,19 @@ pub trait WrappingObjectStore: std::fmt::Debug + Send + Sync {
     /// The store_prefix is a string which uniquely identifies the object
     /// store being wrapped.
     fn wrap(&self, store_prefix: &str, original: Arc<dyn OSObjectStore>) -> Arc<dyn OSObjectStore>;
+
+    /// Optionally create a segments function for zero-copy cache page reads.
+    ///
+    /// If the wrapper supports segmented range reads (returning cache pages
+    /// without stitching), this returns a function that performs those reads.
+    /// The `original` store is the unwrapped inner store used for cache misses.
+    fn make_segments_fn(
+        &self,
+        _store_prefix: &str,
+        _original: Arc<dyn OSObjectStore>,
+    ) -> Option<crate::object_reader::SegmentsFn> {
+        None
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -179,11 +205,25 @@ impl WrappingObjectStore for ChainedWrappingObjectStore {
             .iter()
             .fold(original, |acc, wrapper| wrapper.wrap(store_prefix, acc))
     }
+
+    fn make_segments_fn(
+        &self,
+        store_prefix: &str,
+        original: Arc<dyn OSObjectStore>,
+    ) -> Option<crate::object_reader::SegmentsFn> {
+        // Check each wrapper; the first one that provides segments wins
+        for wrapper in &self.wrappers {
+            if let Some(segments_fn) = wrapper.make_segments_fn(store_prefix, original.clone()) {
+                return Some(segments_fn);
+            }
+        }
+        None
+    }
 }
 
 /// Parameters to create an [ObjectStore]
 ///
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct ObjectStoreParams {
     pub block_size: Option<usize>,
     #[deprecated(note = "Implement an ObjectStoreProvider instead")]
@@ -206,6 +246,20 @@ pub struct ObjectStoreParams {
     /// 50GB.
     pub use_constant_size_upload_parts: bool,
     pub list_is_lexically_ordered: Option<bool>,
+    /// Optional function to get segmented byte ranges from a cache without
+    /// stitching multi-page reads into a single buffer.
+    pub segments_fn: Option<crate::object_reader::SegmentsFn>,
+}
+
+impl std::fmt::Debug for ObjectStoreParams {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ObjectStoreParams")
+            .field("block_size", &self.block_size)
+            .field("use_constant_size_upload_parts", &self.use_constant_size_upload_parts)
+            .field("list_is_lexically_ordered", &self.list_is_lexically_ordered)
+            .field("segments_fn", &self.segments_fn.is_some())
+            .finish()
+    }
 }
 
 impl Default for ObjectStoreParams {
@@ -221,6 +275,7 @@ impl Default for ObjectStoreParams {
             storage_options_accessor: None,
             use_constant_size_upload_parts: false,
             list_is_lexically_ordered: None,
+            segments_fn: None,
         }
     }
 }
@@ -264,6 +319,9 @@ impl std::hash::Hash for ObjectStoreParams {
         }
         self.use_constant_size_upload_parts.hash(state);
         self.list_is_lexically_ordered.hash(state);
+        if let Some(segments_fn) = &self.segments_fn {
+            Arc::as_ptr(segments_fn).hash(state);
+        }
     }
 }
 
@@ -301,6 +359,8 @@ impl PartialEq for ObjectStoreParams {
                     .map(|a| a.accessor_id())
             && self.use_constant_size_upload_parts == other.use_constant_size_upload_parts
             && self.list_is_lexically_ordered == other.list_is_lexically_ordered
+            && self.segments_fn.as_ref().map(Arc::as_ptr)
+                == other.segments_fn.as_ref().map(Arc::as_ptr)
     }
 }
 
@@ -429,7 +489,11 @@ impl ObjectStore {
             let mut inner = store.clone();
             let store_prefix =
                 registry.calculate_object_store_prefix(uri, params.storage_options())?;
+            let mut segments_fn = params.segments_fn.clone();
             if let Some(wrapper) = params.object_store_wrapper.as_ref() {
+                if segments_fn.is_none() {
+                    segments_fn = wrapper.make_segments_fn(&store_prefix, inner.clone());
+                }
                 inner = wrapper.wrap(&store_prefix, inner);
             }
 
@@ -448,6 +512,7 @@ impl ObjectStore {
                 download_retry_count: DEFAULT_DOWNLOAD_RETRY_COUNT,
                 io_tracker,
                 store_prefix: String::new(), // custom object store, no prefix needed
+                segments_fn,
             };
             let path = Path::parse(path.path())?;
             return Ok((Arc::new(store), path));
@@ -581,13 +646,19 @@ impl ObjectStore {
                 )
                 .await
             }
-            _ => Ok(Box::new(CloudObjectReader::new(
-                self.inner.clone(),
-                path.clone(),
-                self.block_size,
-                None,
-                self.download_retry_count,
-            )?)),
+            _ => {
+                let mut reader = CloudObjectReader::new(
+                    self.inner.clone(),
+                    path.clone(),
+                    self.block_size,
+                    None,
+                    self.download_retry_count,
+                )?;
+                if let Some(ref segments_fn) = self.segments_fn {
+                    reader = reader.with_segments_fn(segments_fn.clone());
+                }
+                Ok(Box::new(reader))
+            }
         }
     }
 
@@ -618,13 +689,19 @@ impl ObjectStore {
                 )
                 .await
             }
-            _ => Ok(Box::new(CloudObjectReader::new(
-                self.inner.clone(),
-                path.clone(),
-                self.block_size,
-                Some(known_size),
-                self.download_retry_count,
-            )?)),
+            _ => {
+                let mut reader = CloudObjectReader::new(
+                    self.inner.clone(),
+                    path.clone(),
+                    self.block_size,
+                    Some(known_size),
+                    self.download_retry_count,
+                )?;
+                if let Some(ref segments_fn) = self.segments_fn {
+                    reader = reader.with_segments_fn(segments_fn.clone());
+                }
+                Ok(Box::new(reader))
+            }
         }
     }
 
@@ -902,7 +979,14 @@ impl ObjectStore {
             download_retry_count,
             io_tracker,
             store_prefix,
+            segments_fn: None,
         }
+    }
+
+    /// Set a segments function that returns cache page segments without stitching.
+    pub fn with_segments_fn(mut self, segments_fn: crate::object_reader::SegmentsFn) -> Self {
+        self.segments_fn = Some(segments_fn);
+        self
     }
 }
 

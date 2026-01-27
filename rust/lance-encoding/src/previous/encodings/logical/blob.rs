@@ -19,6 +19,7 @@ use lance_core::{datatypes::BLOB_DESC_FIELDS, Error, Result};
 
 use crate::{
     buffer::LanceBuffer,
+    concat_segments,
     decoder::{
         DecodeArrayTask, FilterExpression, MessageType, NextDecodeTask, PriorityRange,
         ScheduledScanLine, SchedulerContext,
@@ -210,7 +211,7 @@ impl LogicalPageDecoder for BlobFieldDecoder {
                 .io
                 .submit_request(ranges, self.base_priority + start as u64)
                 .await?;
-            self.loaded.extend(bytes);
+            self.loaded.extend(bytes.into_iter().map(concat_segments));
             Ok(())
         }
         .boxed()

@@ -10,6 +10,7 @@ use std::ops::Range;
 use std::sync::{Arc, Mutex};
 
 use crate::buffer::LanceBuffer;
+use crate::concat_segments;
 use crate::data::{BlockInfo, DataBlock, FixedWidthDataBlock};
 use crate::encodings::physical::block::{
     CompressionConfig, CompressionScheme, GeneralBufferCompressor,
@@ -106,6 +107,7 @@ impl PageScheduler for ValuePageScheduler {
         let compression_config = self.compression_config;
         async move {
             let bytes = bytes.await?;
+            let bytes: Vec<Bytes> = bytes.into_iter().map(concat_segments).collect();
 
             Ok(Box::new(ValuePageDecoder {
                 bytes_per_value,

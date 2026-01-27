@@ -58,10 +58,10 @@ impl EncodingsIo for SimulatedScheduler {
         &self,
         ranges: Vec<Range<u64>>,
         priority: u64,
-    ) -> BoxFuture<'static, Result<Vec<Bytes>>> {
-        let data = ranges
+    ) -> BoxFuture<'static, Result<Vec<Vec<Bytes>>>> {
+        let data: Vec<Vec<Bytes>> = ranges
             .into_iter()
-            .map(|range| self.data.slice(range.start as usize..range.end as usize))
+            .map(|range| vec![self.data.slice(range.start as usize..range.end as usize)])
             .collect();
 
         log::trace!("Scheduled request with priority {}", priority);

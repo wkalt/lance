@@ -12,6 +12,7 @@ use log::trace;
 
 use crate::{
     buffer::LanceBuffer,
+    concat_segments,
     data::{BlockInfo, DataBlock, FixedWidthDataBlock},
     decoder::{PageScheduler, PrimitivePageDecoder},
     EncodingsIo,
@@ -73,7 +74,7 @@ impl PageScheduler for DenseBitmapScheduler {
                 .into_iter()
                 .zip(chunk_reqs)
                 .map(|(bytes, (_, bit_offset, length))| BitmapData {
-                    data: bytes,
+                    data: concat_segments(bytes),
                     bit_offset,
                     length,
                 })

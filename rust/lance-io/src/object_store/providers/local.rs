@@ -34,6 +34,7 @@ impl ObjectStoreProvider for FileStoreProvider {
             io_tracker: Default::default(),
             store_prefix: self
                 .calculate_object_store_prefix(&base_path, params.storage_options())?,
+            segments_fn: None,
         })
     }
 

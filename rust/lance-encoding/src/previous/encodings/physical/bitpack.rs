@@ -21,6 +21,7 @@ use lance_bitpacking::BitPacking;
 use lance_core::{Error, Result};
 
 use crate::buffer::LanceBuffer;
+use crate::concat_segments;
 use crate::data::BlockInfo;
 use crate::data::{DataBlock, FixedWidthDataBlock, NullableDataBlock};
 use crate::decoder::{PageScheduler, PrimitivePageDecoder};
@@ -439,7 +440,7 @@ impl PageScheduler for BitpackedForNonNegScheduler {
         let num_rows = ranges.iter().map(|range| range.end - range.start).sum();
 
         async move {
-            let bytes = bytes.await?;
+            let bytes: Vec<Bytes> = bytes.await?.into_iter().map(concat_segments).collect();
             let decompressed_output = bitpacked_for_non_neg_decode(
                 compressed_bit_width,
                 uncompressed_bits_per_value,
@@ -888,7 +889,7 @@ impl PageScheduler for BitpackedScheduler {
         let uncompressed_bits_per_value = self.uncompressed_bits_per_value;
         let signed = self.signed;
         async move {
-            let bytes = bytes.await?;
+            let bytes: Vec<Bytes> = bytes.await?.into_iter().map(concat_segments).collect();
             Ok(Box::new(BitpackedPageDecoder {
                 buffer_bit_start_offsets,
                 buffer_bit_end_offsets,

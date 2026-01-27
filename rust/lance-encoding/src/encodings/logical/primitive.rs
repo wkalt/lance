@@ -81,7 +81,7 @@ use crate::{
         EncodeTask, EncodedColumn, EncodedPage, EncodingOptions, FieldEncoder, OutOfLineBuffers,
     },
     repdef::{LevelBuffer, RepDefBuilder, RepDefUnraveler},
-    EncodingsIo,
+    concat_segments, EncodingsIo,
 };
 
 pub mod blob;
@@ -800,7 +800,7 @@ impl StructuralPageScheduler for ComplexAllNullScheduler {
             let mut data_iter = data.into_iter();
 
             let rep = if has_rep {
-                let rep = data_iter.next().unwrap();
+                let rep = concat_segments(data_iter.next().unwrap());
                 let rep = LanceBuffer::from_bytes(rep, 2);
                 let rep = rep.borrow_to_typed_slice::<u16>();
                 Some(rep)
@@ -809,7 +809,7 @@ impl StructuralPageScheduler for ComplexAllNullScheduler {
             };
 
             let def = if has_def {
-                let def = data_iter.next().unwrap();
+                let def = concat_segments(data_iter.next().unwrap());
                 let def = LanceBuffer::from_bytes(def, 2);
                 let def = def.borrow_to_typed_slice::<u16>();
                 Some(def)
@@ -1656,9 +1656,12 @@ impl StructuralPageScheduler for MiniBlockScheduler {
 
         async move {
             let mut buffers = io_req.await?.into_iter().fuse();
-            let meta_bytes = buffers.next().unwrap();
-            let dictionary_bytes = self.dictionary.as_ref().and_then(|_| buffers.next());
-            let rep_index_bytes = buffers.next();
+            let meta_bytes = concat_segments(buffers.next().unwrap());
+            let dictionary_bytes = self
+                .dictionary
+                .as_ref()
+                .and_then(|_| buffers.next().map(concat_segments));
+            let rep_index_bytes = buffers.next().map(concat_segments);
 
             // Parse the metadata and build the chunk meta
             assert!(meta_bytes.len() % 2 == 0);
@@ -1784,7 +1787,7 @@ impl StructuralPageScheduler for MiniBlockScheduler {
         let res = async move {
             let loaded_chunk_data = loaded_chunk_data.await?;
             for (loaded_chunk, chunk_data) in loaded_chunks.iter_mut().zip(loaded_chunk_data) {
-                loaded_chunk.data = LanceBuffer::from_bytes(chunk_data, 1);
+                loaded_chunk.data = LanceBuffer::from_bytes(concat_segments(chunk_data), 1);
             }
 
             Ok(Box::new(MiniBlockDecoder {
@@ -2077,7 +2080,7 @@ impl FullZipScheduler {
             let rep_buffer = LanceBuffer::concat(
                 &rep_data
                     .into_iter()
-                    .map(|d| LanceBuffer::from_bytes(d, 1))
+                    .map(|d| LanceBuffer::from_bytes(concat_segments(d), 1))
                     .collect::<Vec<_>>(),
             );
             Ok(Self::extract_byte_ranges_from_pairs(
@@ -2121,7 +2124,7 @@ impl FullZipScheduler {
             let data = io_clone.submit_request(byte_ranges, priority).await?;
             let data = data
                 .into_iter()
-                .map(|d| LanceBuffer::from_bytes(d, 1))
+                .map(|d| LanceBuffer::from_bytes(concat_segments(d), 1))
                 .collect::<VecDeque<_>>();
 
             // Step 3: Calculate total rows
@@ -2175,7 +2178,7 @@ impl FullZipScheduler {
             let data = data.await?;
             let data = data
                 .into_iter()
-                .map(|d| LanceBuffer::from_bytes(d, 1))
+                .map(|d| LanceBuffer::from_bytes(concat_segments(d), 1))
                 .collect();
             Ok(Box::new(FixedFullZipDecoder {
                 details,
@@ -2232,7 +2235,7 @@ impl StructuralPageScheduler for FullZipScheduler {
             let io_clone = io.clone();
             let future = async move {
                 let rep_index_data = io_clone.submit_request(vec![rep_index_range], 0).await?;
-                let rep_index_buffer = LanceBuffer::from_bytes(rep_index_data[0].clone(), 1);
+                let rep_index_buffer = LanceBuffer::from_bytes(concat_segments(rep_index_data.into_iter().next().unwrap()), 1);
 
                 // Create and return the cacheable state
                 Ok(Arc::new(FullZipCacheableState { rep_index_buffer }) as Arc<dyn CachedPageData>)

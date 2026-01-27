@@ -97,6 +97,15 @@ pub trait Reader: std::fmt::Debug + Send + Sync + DeepSizeOf {
     /// TODO: change to read_at()?
     async fn get_range(&self, range: Range<usize>) -> object_store::Result<Bytes>;
 
+    /// Read a range of bytes, returning segments (one per cache page) without
+    /// stitching them into a single contiguous buffer.
+    ///
+    /// The default implementation falls back to `get_range` and wraps the result
+    /// in a single-element Vec.
+    async fn get_range_segments(&self, range: Range<usize>) -> object_store::Result<Vec<Bytes>> {
+        self.get_range(range).await.map(|b| vec![b])
+    }
+
     /// Read all bytes from the object.
     ///
     /// By default this reads the size in a separate IOP but some implementations

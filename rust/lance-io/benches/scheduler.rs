@@ -52,13 +52,16 @@ async fn create_data(num_bytes: u64) -> (Arc<ObjectStore>, Path) {
 
 const DATA_SIZE: u64 = 128 * 1024 * 1024;
 
-async fn drain_task<F: std::future::Future<Output = Result<Vec<Bytes>>>>(
+async fn drain_task<F: std::future::Future<Output = Result<Vec<Vec<Bytes>>>>>(
     mut rx: tokio::sync::mpsc::Receiver<F>,
 ) -> u64 {
     let mut bytes_received = 0;
     while let Some(fut) = rx.recv().await {
         let loaded = fut.await.unwrap();
-        bytes_received += loaded.iter().map(|bytes| bytes.len() as u64).sum::<u64>();
+        bytes_received += loaded
+            .iter()
+            .map(|segments| segments.iter().map(|b| b.len() as u64).sum::<u64>())
+            .sum::<u64>();
     }
     bytes_received
 }

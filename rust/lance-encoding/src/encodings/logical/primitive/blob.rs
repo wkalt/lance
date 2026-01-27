@@ -19,6 +19,7 @@ use lance_core::{
 
 use crate::{
     buffer::LanceBuffer,
+    concat_segments,
     data::{BlockInfo, DataBlock, VariableWidthBlock},
     decoder::{DecodePageTask, DecodedPage, StructuralPageDecoder},
     encodings::logical::primitive::{CachedPageData, PageLoadTask, StructuralPageScheduler},
@@ -265,7 +266,7 @@ impl BlobPageScheduler {
             let mut bytes_iter = bytes.into_iter();
             for blob in loaded_blobs.iter_mut() {
                 if blob.def == 0 {
-                    blob.set_bytes(bytes_iter.next().expect_ok()?);
+                    blob.set_bytes(concat_segments(bytes_iter.next().expect_ok()?));
                 }
             }
             debug_assert!(bytes_iter.next().is_none());

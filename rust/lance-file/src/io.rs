@@ -27,7 +27,7 @@ impl EncodingsIo for LanceEncodingsIo {
         &self,
         ranges: Vec<std::ops::Range<u64>>,
         priority: u64,
-    ) -> BoxFuture<'static, lance_core::Result<Vec<bytes::Bytes>>> {
+    ) -> BoxFuture<'static, lance_core::Result<Vec<Vec<bytes::Bytes>>>> {
         // Range splitting and reassembly is handled by FileScheduler, which
         // splits by max_iop_size and reassembles results. No need to duplicate
         // that here.

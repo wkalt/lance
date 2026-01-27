@@ -11,6 +11,7 @@ use lance_arrow::DataTypeExt;
 use lance_core::{Error, Result};
 use snafu::location;
 
+use crate::concat_segments;
 use crate::data::BlockInfo;
 use crate::data::FixedSizeListBlock;
 use crate::format::ProtobufUtils;
@@ -87,6 +88,7 @@ impl PageScheduler for PackedStructPageScheduler {
 
             let mut combined_bytes = BytesMut::default();
             for byte_slice in bytes {
+                let byte_slice = concat_segments(byte_slice);
                 combined_bytes.extend_from_slice(&byte_slice);
             }
 

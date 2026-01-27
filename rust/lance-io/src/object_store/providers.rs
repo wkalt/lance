@@ -208,7 +208,16 @@ impl ObjectStoreRegistry {
         store.inner = store.inner.traced();
 
         if let Some(wrapper) = &params.object_store_wrapper {
+            // Create segments_fn before wrapping (needs the unwrapped inner store)
+            if let Some(segments_fn) = wrapper.make_segments_fn(&cache_path, store.inner.clone()) {
+                store.segments_fn = Some(segments_fn);
+            }
             store.inner = wrapper.wrap(&cache_path, store.inner);
+        }
+
+        // Allow explicit segments_fn from params to override
+        if let Some(ref segments_fn) = params.segments_fn {
+            store.segments_fn = Some(segments_fn.clone());
         }
 
         // Always wrap with IO tracking

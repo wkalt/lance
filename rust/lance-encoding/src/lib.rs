@@ -60,20 +60,37 @@ pub trait EncodingsIo: std::fmt::Debug + Send + Sync {
         &self,
         range: Vec<Range<u64>>,
         priority: u64,
-    ) -> BoxFuture<'static, Result<Vec<Bytes>>>;
+    ) -> BoxFuture<'static, Result<Vec<Vec<Bytes>>>>;
 
     /// Submit an I/O request with a single range
     ///
-    /// This is just a utitliy function that wraps [`EncodingsIo::submit_request`] for the common
-    /// case of a single range request.
+    /// This is just a utility function that wraps [`EncodingsIo::submit_request`] for the common
+    /// case of a single range request.  The returned segments are concatenated into a single
+    /// contiguous buffer (zero-copy if there is only one segment).
     fn submit_single(
         &self,
         range: std::ops::Range<u64>,
         priority: u64,
     ) -> BoxFuture<'static, lance_core::Result<bytes::Bytes>> {
         self.submit_request(vec![range], priority)
-            .map_ok(|mut v| v.pop().unwrap())
+            .map_ok(|mut v| concat_segments(v.pop().unwrap()))
             .boxed()
+    }
+}
+
+/// Concatenate segments into a single contiguous Bytes buffer.
+///
+/// If there is only one segment, this is zero-copy.
+pub fn concat_segments(segments: Vec<Bytes>) -> Bytes {
+    if segments.len() == 1 {
+        segments.into_iter().next().unwrap()
+    } else {
+        let total: usize = segments.iter().map(|s| s.len()).sum();
+        let mut buf = Vec::with_capacity(total);
+        for s in &segments {
+            buf.extend_from_slice(s);
+        }
+        buf.into()
     }
 }
 
@@ -98,10 +115,10 @@ impl EncodingsIo for BufferScheduler {
         &self,
         ranges: Vec<Range<u64>>,
         _priority: u64,
-    ) -> BoxFuture<'static, Result<Vec<Bytes>>> {
+    ) -> BoxFuture<'static, Result<Vec<Vec<Bytes>>>> {
         std::future::ready(Ok(ranges
             .into_iter()
-            .map(|range| self.satisfy_request(range))
+            .map(|range| vec![self.satisfy_request(range)])
             .collect::<Vec<_>>()))
         .boxed()
     }

@@ -7,10 +7,8 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use bytes::Bytes;
 use deepsize::DeepSizeOf;
-use futures::{
-    future::{BoxFuture, Shared},
-    FutureExt,
-};
+use futures::future::{BoxFuture, Shared};
+use futures::FutureExt;
 use lance_core::{error::CloneableError, Error, Result};
 use object_store::{path::Path, GetOptions, GetResult, ObjectStore, Result as OSResult};
 use tokio::sync::OnceCell;
@@ -18,10 +16,14 @@ use tracing::instrument;
 
 use crate::{object_store::DEFAULT_CLOUD_IO_PARALLELISM, traits::Reader};
 
+/// A type-erased function that returns segmented byte ranges from a cache,
+/// avoiding the stitching copy for multi-page reads.
+pub type SegmentsFn =
+    Arc<dyn Fn(&Path, Range<u64>) -> BoxFuture<'static, OSResult<Vec<Bytes>>> + Send + Sync>;
+
 /// Object Reader
 ///
 /// Object Store + Base Path
-#[derive(Debug)]
 pub struct CloudObjectReader {
     // Object Store.
     pub object_store: Arc<dyn ObjectStore>,
@@ -32,6 +34,24 @@ pub struct CloudObjectReader {
 
     block_size: usize,
     download_retry_count: usize,
+    segments_fn: Option<SegmentsFn>,
+}
+
+impl std::fmt::Debug for CloudObjectReader {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CloudObjectReader")
+            .field("path", &self.path)
+            .field("block_size", &self.block_size)
+            .field(
+                "segments_fn",
+                &if self.segments_fn.is_some() {
+                    "Some(<fn>)"
+                } else {
+                    "None"
+                },
+            )
+            .finish()
+    }
 }
 
 impl DeepSizeOf for CloudObjectReader {
@@ -56,7 +76,14 @@ impl CloudObjectReader {
             size: OnceCell::new_with(known_size),
             block_size,
             download_retry_count,
+            segments_fn: None,
         })
+    }
+
+    /// Set a segments function that returns cache page segments without stitching.
+    pub fn with_segments_fn(mut self, segments_fn: SegmentsFn) -> Self {
+        self.segments_fn = Some(segments_fn);
+        self
     }
 
     // Retries for the initial request are handled by object store, but
@@ -161,6 +188,14 @@ impl Reader for CloudObjectReader {
             || format!("range {:?}", range),
         )
         .await
+    }
+
+    async fn get_range_segments(&self, range: Range<usize>) -> OSResult<Vec<Bytes>> {
+        if let Some(ref segments_fn) = self.segments_fn {
+            segments_fn(&self.path, range.start as u64..range.end as u64).await
+        } else {
+            self.get_range(range).await.map(|b| vec![b])
+        }
     }
 
     #[instrument(level = "debug", skip_all)]

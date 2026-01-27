@@ -361,7 +361,7 @@ impl IoQueue {
 // complete
 struct MutableBatch<F: FnOnce(Response) + Send> {
     when_done: Option<F>,
-    data_buffers: Vec<Bytes>,
+    data_buffers: Vec<Vec<Bytes>>,
     num_bytes: u64,
     priority: u128,
     num_reqs: usize,
@@ -372,7 +372,7 @@ impl<F: FnOnce(Response) + Send> MutableBatch<F> {
     fn new(when_done: F, num_data_buffers: u32, priority: u128, num_reqs: usize) -> Self {
         Self {
             when_done: Some(when_done),
-            data_buffers: vec![Bytes::default(); num_data_buffers as usize],
+            data_buffers: vec![Vec::new(); num_data_buffers as usize],
             num_bytes: 0,
             priority,
             num_reqs,
@@ -413,7 +413,7 @@ impl<F: FnOnce(Response) + Send> Drop for MutableBatch<F> {
 struct DataChunk {
     task_idx: usize,
     num_bytes: u64,
-    data: Result<Bytes>,
+    data: Result<Vec<Bytes>>,
 }
 
 trait DataSink: Send {
@@ -425,8 +425,8 @@ impl<F: FnOnce(Response) + Send> DataSink for MutableBatch<F> {
     fn deliver_data(&mut self, data: DataChunk) {
         self.num_bytes += data.num_bytes;
         match data.data {
-            Ok(data_bytes) => {
-                self.data_buffers[data.task_idx] = data_bytes;
+            Ok(segments) => {
+                self.data_buffers[data.task_idx] = segments;
             }
             Err(err) => {
                 // This keeps the original error, if present
@@ -439,7 +439,7 @@ impl<F: FnOnce(Response) + Send> DataSink for MutableBatch<F> {
 struct IoTask {
     reader: Arc<dyn Reader>,
     to_read: Range<u64>,
-    when_done: Box<dyn FnOnce(Result<Bytes>) + Send>,
+    when_done: Box<dyn FnOnce(Result<Vec<Bytes>>) + Send>,
     priority: u128,
 }
 
@@ -478,15 +478,15 @@ impl IoTask {
     async fn run(self) {
         let file_path = self.reader.path().as_ref();
         let num_bytes = self.num_bytes();
-        let bytes = if self.to_read.start == self.to_read.end {
-            Ok(Bytes::new())
+        let segments = if self.to_read.start == self.to_read.end {
+            Ok(vec![Bytes::new()])
         } else {
-            let bytes_fut = self
+            let segments_fut = self
                 .reader
-                .get_range(self.to_read.start as usize..self.to_read.end as usize);
+                .get_range_segments(self.to_read.start as usize..self.to_read.end as usize);
             IOPS_COUNTER.fetch_add(1, Ordering::Release);
             let num_bytes = self.num_bytes();
-            bytes_fut
+            segments_fut
                 .inspect(move |_| {
                     BYTES_READ_COUNTER.fetch_add(num_bytes, Ordering::Release);
                 })
@@ -503,7 +503,7 @@ impl IoTask {
             "File I/O completed"
         );
         IOPS_QUOTA.release();
-        (self.when_done)(bytes);
+        (self.when_done)(segments);
     }
 }
 
@@ -603,7 +603,7 @@ impl Debug for ScanScheduler {
 }
 
 struct Response {
-    data: Result<Vec<Bytes>>,
+    data: Result<Vec<Vec<Bytes>>>,
     priority: u128,
     num_reqs: usize,
     num_bytes: u64,
@@ -757,7 +757,7 @@ impl ScanScheduler {
         reader: Arc<dyn Reader>,
         request: Vec<Range<u64>>,
         priority: u128,
-    ) -> impl Future<Output = Result<Vec<Bytes>>> + Send {
+    ) -> impl Future<Output = Result<Vec<Vec<Bytes>>>> + Send {
         let (tx, rx) = oneshot::channel::<Response>();
 
         self.do_submit_request(reader, request, tx, priority);
@@ -805,6 +805,54 @@ pub struct FileScheduler {
     max_iop_size: u64,
 }
 
+/// Concatenate segments into a single contiguous Bytes buffer.
+///
+/// If there is only one segment, this is zero-copy.
+fn concat_segments(segments: Vec<Bytes>) -> Bytes {
+    if segments.len() == 1 {
+        segments.into_iter().next().unwrap()
+    } else {
+        let total: usize = segments.iter().map(|s| s.len()).sum();
+        let mut buf = Vec::with_capacity(total);
+        for s in &segments {
+            buf.extend_from_slice(s);
+        }
+        buf.into()
+    }
+}
+
+/// Slice a list of contiguous segments to a byte sub-range [start..end).
+///
+/// This preserves the segment boundaries (zero-copy slicing of individual
+/// Bytes segments) rather than copying into a contiguous buffer.
+fn slice_segments(segments: &[Bytes], start: usize, end: usize) -> Vec<Bytes> {
+    if start == 0 && segments.iter().map(|s| s.len()).sum::<usize>() == end {
+        return segments.to_vec();
+    }
+
+    let mut result = Vec::new();
+    let mut offset = 0;
+    for seg in segments {
+        let seg_end = offset + seg.len();
+        if seg_end <= start {
+            offset = seg_end;
+            continue;
+        }
+        if offset >= end {
+            break;
+        }
+        let slice_start = if offset < start { start - offset } else { 0 };
+        let slice_end = if seg_end > end {
+            end - offset
+        } else {
+            seg.len()
+        };
+        result.push(seg.slice(slice_start..slice_end));
+        offset = seg_end;
+    }
+    result
+}
+
 fn is_close_together(range1: &Range<u64>, range2: &Range<u64>, block_size: u64) -> bool {
     // Note that range1.end <= range2.start is possible (e.g. when decoding string arrays)
     range2.start <= (range1.end + block_size)
@@ -831,7 +879,7 @@ impl FileScheduler {
         &self,
         request: Vec<Range<u64>>,
         priority: u64,
-    ) -> impl Future<Output = Result<Vec<Bytes>>> + Send {
+    ) -> impl Future<Output = Result<Vec<Vec<Bytes>>>> + Send {
         // The final priority is a combination of the row offset and the file number
         let priority = ((self.base_priority as u128) << 64) + priority as u128;
 
@@ -874,15 +922,15 @@ impl FileScheduler {
 
         self.root.stats.record_request(&updated_requests);
 
-        let bytes_vec_fut =
+        let segments_vec_fut =
             self.root
                 .submit_request(self.reader.clone(), updated_requests.clone(), priority);
 
         let mut updated_index = 0;
-        let mut final_bytes = Vec::with_capacity(request.len());
+        let mut final_segments: Vec<Vec<Bytes>> = Vec::with_capacity(request.len());
 
         async move {
-            let bytes_vec = bytes_vec_fut.await?;
+            let segments_vec = segments_vec_fut.await?;
 
             let mut orig_index = 0;
             while (updated_index < updated_requests.len()) && (orig_index < request.len()) {
@@ -894,28 +942,38 @@ impl FileScheduler {
                     // We need to undo the coalescing and splitting done earlier
                     let start = orig_range.start as usize - byte_offset;
                     if orig_range.end <= updated_range.end {
-                        // The original range is fully contained in the updated range, can do
-                        // zero-copy slice
+                        // The original range is fully contained in the updated range.
+                        // Slice the segments to the requested sub-range.
                         let end = orig_range.end as usize - byte_offset;
-                        final_bytes.push(bytes_vec[updated_index].slice(start..end));
+                        let iop_segments = &segments_vec[updated_index];
+                        final_segments.push(slice_segments(iop_segments, start, end));
                     } else {
-                        // The original read was split into multiple requests, need to copy
-                        // back into a single buffer
-                        let orig_size = orig_range.end - orig_range.start;
-                        let mut merged_bytes = Vec::with_capacity(orig_size as usize);
-                        merged_bytes.extend_from_slice(&bytes_vec[updated_index].slice(start..));
-                        let mut copy_offset = merged_bytes.len() as u64;
-                        while copy_offset < orig_size {
+                        // The original read was split into multiple requests.
+                        // Concatenate segment lists from each IOP, then slice.
+                        let orig_size = (orig_range.end - orig_range.start) as usize;
+                        let mut all_segments: Vec<Bytes> = Vec::new();
+                        // First IOP: skip `start` bytes
+                        let first_segments = &segments_vec[updated_index];
+                        let first_iop_size =
+                            (updated_range.end - updated_range.start) as usize;
+                        all_segments
+                            .extend(slice_segments(first_segments, start, first_iop_size));
+                        let mut collected = first_iop_size - start;
+                        while collected < orig_size {
                             updated_index += 1;
                             let next_range = &updated_requests[updated_index];
-                            let bytes_to_take =
-                                (orig_size - copy_offset).min(next_range.end - next_range.start);
-                            merged_bytes.extend_from_slice(
-                                &bytes_vec[updated_index].slice(0..bytes_to_take as usize),
-                            );
-                            copy_offset += bytes_to_take;
+                            let next_iop_size =
+                                (next_range.end - next_range.start) as usize;
+                            let bytes_to_take = (orig_size - collected).min(next_iop_size);
+                            let next_segments = &segments_vec[updated_index];
+                            all_segments.extend(slice_segments(
+                                next_segments,
+                                0,
+                                bytes_to_take,
+                            ));
+                            collected += bytes_to_take;
                         }
-                        final_bytes.push(Bytes::from(merged_bytes));
+                        final_segments.push(all_segments);
                     }
                     orig_index += 1;
                 } else {
@@ -923,7 +981,7 @@ impl FileScheduler {
                 }
             }
 
-            Ok(final_bytes)
+            Ok(final_segments)
         }
     }
 
@@ -949,7 +1007,7 @@ impl FileScheduler {
         priority: u64,
     ) -> impl Future<Output = Result<Bytes>> + Send {
         self.submit_request(vec![range], priority)
-            .map_ok(|vec_bytes| vec_bytes.into_iter().next().unwrap())
+            .map_ok(|vec_segments| concat_segments(vec_segments.into_iter().next().unwrap()))
     }
 
     /// Provides access to the underlying reader
@@ -1021,9 +1079,9 @@ mod tests {
         // Note: we should get parallel I/O even though we are consuming serially
         while offset < DATA_SIZE {
             let data = reqs.pop_front().unwrap();
-            let actual = &data[0];
+            let actual = concat_segments(data[0].clone());
             let expected = &some_data[offset as usize..(offset + READ_SIZE) as usize];
-            assert_eq!(expected, actual);
+            assert_eq!(expected, &actual[..]);
             offset += READ_SIZE;
         }
     }
@@ -1054,18 +1112,18 @@ mod tests {
         let req =
             file_scheduler.submit_request(vec![50_000..51_000, 52_000..53_000, 54_000..55_000], 0);
 
-        let bytes = req.await.unwrap();
+        let segments = req.await.unwrap();
 
-        assert_eq!(bytes[0], &some_data[50_000..51_000]);
-        assert_eq!(bytes[1], &some_data[52_000..53_000]);
-        assert_eq!(bytes[2], &some_data[54_000..55_000]);
+        assert_eq!(concat_segments(segments[0].clone()), &some_data[50_000..51_000]);
+        assert_eq!(concat_segments(segments[1].clone()), &some_data[52_000..53_000]);
+        assert_eq!(concat_segments(segments[2].clone()), &some_data[54_000..55_000]);
 
         assert_eq!(1, scheduler.stats().iops);
 
         // This should be split into 5 requests because it is so large
         let req = file_scheduler.submit_request(vec![0..DATA_SIZE], 0);
-        let bytes = req.await.unwrap();
-        assert!(bytes[0] == some_data, "data is not the same");
+        let segments = req.await.unwrap();
+        assert!(concat_segments(segments[0].clone()) == some_data, "data is not the same");
 
         assert_eq!(6, scheduler.stats().iops);
 
@@ -1082,18 +1140,18 @@ mod tests {
             0,
         );
 
-        let bytes = req.await.unwrap();
+        let segments = req.await.unwrap();
         let chunk_size = chunk_size as usize;
         assert!(
-            bytes[0] == some_data[10..chunk_size],
+            concat_segments(segments[0].clone()) == some_data[10..chunk_size],
             "data is not the same"
         );
         assert!(
-            bytes[1] == some_data[chunk_size + 10..(chunk_size * 2) - 20],
+            concat_segments(segments[1].clone()) == some_data[chunk_size + 10..(chunk_size * 2) - 20],
             "data is not the same"
         );
         assert!(
-            bytes[2] == some_data[chunk_size * 2..(chunk_size * 2) + 10],
+            concat_segments(segments[2].clone()) == some_data[chunk_size * 2..(chunk_size * 2) + 10],
             "data is not the same"
         );
         assert_eq!(8, scheduler.stats().iops);
@@ -1102,10 +1160,10 @@ mod tests {
             .map(|i| i * 1_000_000..(i + 1) * 1_000_000)
             .collect::<Vec<_>>();
         let req = file_scheduler.submit_request(reads, 0);
-        let bytes = req.await.unwrap();
-        for (i, bytes) in bytes.iter().enumerate() {
+        let segments = req.await.unwrap();
+        for (i, segs) in segments.iter().enumerate() {
             assert!(
-                bytes == &some_data[i * 1_000_000..(i + 1) * 1_000_000],
+                concat_segments(segs.clone()) == some_data[i * 1_000_000..(i + 1) * 1_000_000],
                 "data is not the same"
             );
         }
@@ -1299,11 +1357,15 @@ mod tests {
         wait_for_bytes_read_and_idle(21).await;
 
         // Fifth future should eventually finish due to deadlock prevention
-        let fifth_bytes = tokio::time::timeout(Duration::from_secs(10), fifth_fut)
+        let fifth_segments = tokio::time::timeout(Duration::from_secs(10), fifth_fut)
             .await
             .unwrap();
         assert_eq!(
-            fifth_bytes.unwrap().iter().map(|b| b.len()).sum::<usize>(),
+            fifth_segments
+                .unwrap()
+                .iter()
+                .map(|segs| segs.iter().map(|b| b.len()).sum::<usize>())
+                .sum::<usize>(),
             10
         );
 
