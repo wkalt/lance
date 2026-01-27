@@ -4961,7 +4961,6 @@ dependencies = [
  "strum 0.26.3",
  "test-log",
  "tokio",
- "tokio-util",
  "tracing",
  "xxhash-rust",
  "zstd",

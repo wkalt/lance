@@ -222,9 +222,7 @@ use arrow_schema::{ArrowError, DataType, Field as ArrowField, Fields, Schema as 
 use bytes::Bytes;
 use futures::future::{maybe_done, BoxFuture, MaybeDone};
 use futures::stream::{self, BoxStream};
-use futures::{FutureExt, Stream, StreamExt};
-use std::pin::Pin;
-use std::task::{Context, Poll};
+use futures::{FutureExt, StreamExt};
 use lance_arrow::DataTypeExt;
 use lance_core::cache::LanceCache;
 use lance_core::datatypes::{Field, Schema, BLOB_DESC_LANCE_FIELD};
@@ -233,7 +231,7 @@ use log::{debug, trace, warn};
 use snafu::location;
 use tokio::sync::mpsc::error::SendError;
 use tokio::sync::mpsc::{self, unbounded_channel};
-use tokio::sync::{OwnedSemaphorePermit, Semaphore};
+use tokio::sync::Semaphore;
 
 use lance_core::{ArrowResult, Error, Result};
 use tracing::instrument;
@@ -1093,7 +1091,6 @@ impl DecodeBatchScheduler {
                 if !schedule_action(Ok(DecoderMessage {
                     scheduled_so_far: num_rows_scheduled,
                     decoders: next_scan_line.decoders,
-                    backpressure_permit: None,
                 })) {
                     // Decoder has disconnected
                     return;
@@ -1156,7 +1153,6 @@ impl DecodeBatchScheduler {
             if !schedule_action(Ok(DecoderMessage {
                 scheduled_so_far: num_rows_scheduled,
                 decoders: next_scan_line.decoders,
-                backpressure_permit: None,
             })) {
                 // Decoder has disconnected
                 return;
@@ -1930,32 +1926,6 @@ pub fn create_decode_iterator(
     }
 }
 
-/// A wrapper around a decode stream that cancels the scheduler when dropped.
-/// This ensures the scheduler task can exit cleanly when the decoder is done or dropped,
-/// rather than blocking forever waiting for permits.
-///
-/// Instead of closing the shared semaphore (which would break other scans),
-/// we use a cancellation token that only affects this scan's scheduler.
-struct BoundedDecodeStream {
-    inner: BoxStream<'static, ReadBatchTask>,
-    cancel: tokio_util::sync::CancellationToken,
-}
-
-impl Stream for BoundedDecodeStream {
-    type Item = ReadBatchTask;
-
-    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        self.inner.as_mut().poll_next(cx)
-    }
-}
-
-impl Drop for BoundedDecodeStream {
-    fn drop(&mut self) {
-        // Signal cancellation so the scheduler can exit if it's waiting for permits.
-        self.cancel.cancel();
-    }
-}
-
 fn create_scheduler_decoder(
     column_infos: Vec<Arc<ColumnInfo>>,
     requested_rows: RequestedRows,
@@ -1969,9 +1939,6 @@ fn create_scheduler_decoder(
     let is_structural = column_infos[0].is_structural();
 
     let backpressure_semaphore = config.backpressure_semaphore.clone();
-    let cancel_token = backpressure_semaphore
-        .as_ref()
-        .map(|_| tokio_util::sync::CancellationToken::new());
 
     let (tx, rx) = mpsc::unbounded_channel();
 
@@ -1984,7 +1951,6 @@ fn create_scheduler_decoder(
         rx,
     );
 
-    let scheduler_cancel = cancel_token.clone();
     let scheduler_handle = tokio::task::spawn(async move {
         let mut decode_scheduler = match DecodeBatchScheduler::try_new(
             target_schema.as_ref(),
@@ -2007,73 +1973,46 @@ fn create_scheduler_decoder(
             }
         };
 
-        if let Some(ref semaphore) = config.backpressure_semaphore {
-            let cancel = scheduler_cancel.expect("cancel token must exist when semaphore is set");
-            // Backpressure path: schedule ranges to vec, then send with permits.
-            // This ensures the scheduler doesn't race ahead of the decoder when
-            // I/O is fast (e.g., cache hits).
-            let ranges = match requested_rows {
-                RequestedRows::Ranges(ranges) => ranges,
-                RequestedRows::Indices(indices) => {
-                    DecodeBatchScheduler::indices_to_ranges(&indices)
-                }
-            };
-            for range in &ranges {
-                let messages = decode_scheduler
-                    .schedule_ranges_to_vec(std::slice::from_ref(range), &filter, config.io.clone(), None)
-                    .map(|msgs| msgs.into_iter().map(Ok).collect::<Vec<_>>())
-                    .unwrap_or_else(|e| vec![Err(e)]);
-                for msg in messages {
-                    // Wait for either a permit or cancellation (stream dropped).
-                    let permit = tokio::select! {
-                        result = semaphore.clone().acquire_owned() => {
-                            match result {
-                                Ok(permit) => Some(permit),
-                                Err(_) => {
-                                    debug!("create_scheduler_decoder aborting: semaphore closed");
-                                    return;
-                                }
-                            }
-                        }
-                        _ = cancel.cancelled() => {
-                            debug!("create_scheduler_decoder aborting: scan cancelled");
-                            return;
-                        }
-                    };
-                    let msg_with_permit = msg.map(|m| DecoderMessage {
-                        scheduled_so_far: m.scheduled_so_far,
-                        decoders: m.decoders,
-                        backpressure_permit: permit,
-                    });
-                    if tx.send(msg_with_permit).is_err() {
-                        debug!(
-                            "create_scheduler_decoder aborting early since decoder appears to have been dropped"
-                        );
-                        return;
-                    }
-                }
+        match requested_rows {
+            RequestedRows::Ranges(ranges) => {
+                decode_scheduler.schedule_ranges(&ranges, &filter, tx, config.io)
             }
-        } else {
-            // Standard path: no backpressure, schedule directly to channel.
-            match requested_rows {
-                RequestedRows::Ranges(ranges) => {
-                    decode_scheduler.schedule_ranges(&ranges, &filter, tx, config.io)
-                }
-                RequestedRows::Indices(indices) => {
-                    decode_scheduler.schedule_take(&indices, &filter, tx, config.io)
-                }
+            RequestedRows::Indices(indices) => {
+                decode_scheduler.schedule_take(&indices, &filter, tx, config.io)
             }
         }
     });
 
     let inner_stream = check_scheduler_on_drop(decode_stream, scheduler_handle);
 
-    if let Some(cancel) = cancel_token {
-        Ok(BoundedDecodeStream {
-            inner: inner_stream,
-            cancel,
-        }
-        .boxed())
+    // If a backpressure semaphore is configured, wrap the output stream so that
+    // each ReadBatchTask acquires a permit before being yielded. The permit is
+    // held inside the task's future and released only after the batch is fully
+    // decoded. This limits how many batches are materializing concurrently,
+    // which is where the actual memory pressure occurs.
+    if let Some(semaphore) = backpressure_semaphore {
+        let throttled = stream::unfold(
+            (inner_stream, semaphore),
+            |(mut inner, sem)| async move {
+                let task = inner.next().await?;
+                // Acquire a permit before yielding this batch task.
+                // If the semaphore is closed (shouldn't happen normally), just
+                // yield without a permit rather than dropping the task.
+                let permit = sem.clone().acquire_owned().await.ok();
+                let throttled_task = ReadBatchTask {
+                    task: async move {
+                        let result = task.task.await;
+                        // Permit is held until decode completes.
+                        drop(permit);
+                        result
+                    }
+                    .boxed(),
+                    num_rows: task.num_rows,
+                };
+                Some((throttled_task, (inner, sem)))
+            },
+        );
+        Ok(throttled.boxed())
     } else {
         Ok(inner_stream)
     }
@@ -2627,11 +2566,6 @@ impl MessageType {
 pub struct DecoderMessage {
     pub scheduled_so_far: u64,
     pub decoders: Vec<MessageType>,
-    /// Optional backpressure permit. When present, this permit is held until the
-    /// message is dropped (i.e., after the decoder has processed it). This
-    /// prevents the scheduler from racing too far ahead of the decoder.
-    #[allow(dead_code)]
-    backpressure_permit: Option<OwnedSemaphorePermit>,
 }
 
 pub struct DecoderContext {
