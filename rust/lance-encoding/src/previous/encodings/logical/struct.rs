@@ -14,7 +14,8 @@ use crate::{
     },
     previous::decoder::{DecoderReady, FieldScheduler, LogicalPageDecoder, SchedulingJob},
 };
-use arrow_array::{ArrayRef, StructArray};
+use arrow_array::{Array, ArrayRef, FixedSizeListArray, StructArray};
+use arrow_buffer::NullBuffer;
 use arrow_schema::{DataType, Field, Fields};
 use futures::{future::BoxFuture, stream::FuturesUnordered, FutureExt, StreamExt, TryStreamExt};
 use lance_core::{Error, Result};
@@ -589,20 +590,73 @@ struct CompositeDecodeTask {
 
 impl CompositeDecodeTask {
     fn decode(self) -> Result<ArrayRef> {
+        // Fast path: single page, no concat needed
+        if self.tasks.len() == 1 {
+            return self.tasks.into_iter().next().unwrap().decode();
+        }
+
         let arrays = self
             .tasks
             .into_iter()
             .map(|task| task.decode())
             .collect::<Result<Vec<_>>>()?;
-        let array_refs = arrays.iter().map(|arr| arr.as_ref()).collect::<Vec<_>>();
-        // TODO: If this is a primitive column we should be able to avoid this
-        // allocation + copy with "page bridging" which could save us a few CPU
-        // cycles.
-        //
-        // This optimization is probably most important for super fast storage like NVME
-        // where the page size can be smaller.
+        let array_refs: Vec<&dyn arrow_array::Array> =
+            arrays.iter().map(|arr| arr.as_ref()).collect();
+
+        // For FixedSizeList columns (vector embeddings), use a specialized path
+        // that concats the child primitive arrays directly, avoiding the slow
+        // MutableArrayData fallback in arrow_select::concat.
+        if let DataType::FixedSizeList(child_field, dim) = array_refs[0].data_type() {
+            return concat_fsl(&array_refs, child_field, *dim);
+        }
+
+        // TODO: page bridging could avoid this copy entirely for primitive
+        // columns by pre-allocating one buffer and having each page decoder
+        // write into it at the correct offset.
         Ok(arrow_select::concat::concat(&array_refs)?)
     }
+}
+
+/// Concatenate FixedSizeList arrays by concatenating their child arrays
+/// directly. The child arrays are typically primitive (f32/f16 for vector
+/// embeddings) and hit the fast `concat_primitives` path in arrow-select,
+/// which does a single memcpy per input buffer rather than element-by-element
+/// copy through MutableArrayData.
+fn concat_fsl(
+    arrays: &[&dyn arrow_array::Array],
+    child_field: &Arc<Field>,
+    dim: i32,
+) -> Result<ArrayRef> {
+    let fsl_arrays: Vec<&FixedSizeListArray> = arrays
+        .iter()
+        .map(|a| a.as_any().downcast_ref::<FixedSizeListArray>().unwrap())
+        .collect();
+
+    let children: Vec<&dyn arrow_array::Array> =
+        fsl_arrays.iter().map(|a| a.values().as_ref()).collect();
+    let concatenated_children = arrow_select::concat::concat(&children)?;
+
+    let total_len: usize = arrays.iter().map(|a| a.len()).sum();
+    let has_nulls = fsl_arrays.iter().any(|a| a.null_count() > 0);
+    let nulls = if has_nulls {
+        let mut builder = arrow_buffer::BooleanBufferBuilder::new(total_len);
+        for a in &fsl_arrays {
+            match a.nulls() {
+                Some(n) => builder.append_buffer(n.inner()),
+                None => builder.append_n(a.len(), true),
+            }
+        }
+        Some(NullBuffer::new(builder.finish()))
+    } else {
+        None
+    };
+
+    Ok(Arc::new(FixedSizeListArray::new(
+        child_field.clone(),
+        dim,
+        concatenated_children,
+        nulls,
+    )))
 }
 
 struct SimpleStructDecodeTask {

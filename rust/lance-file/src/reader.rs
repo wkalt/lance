@@ -788,9 +788,7 @@ impl FileReader {
         let file_metadata = Arc::new(Self::read_all_metadata(&scheduler).await?);
         let path = scheduler.reader().path().clone();
 
-        // Create LanceEncodingsIo with read chunk size from options
-        let encodings_io =
-            LanceEncodingsIo::new(scheduler).with_read_chunk_size(options.read_chunk_size);
+        let encodings_io = LanceEncodingsIo::new(scheduler);
 
         Self::try_open_with_file_metadata(
             Arc::new(encodings_io),
