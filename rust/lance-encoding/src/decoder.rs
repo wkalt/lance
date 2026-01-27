@@ -222,7 +222,9 @@ use arrow_schema::{ArrowError, DataType, Field as ArrowField, Fields, Schema as 
 use bytes::Bytes;
 use futures::future::{maybe_done, BoxFuture, MaybeDone};
 use futures::stream::{self, BoxStream};
-use futures::{FutureExt, StreamExt};
+use futures::{FutureExt, Stream, StreamExt};
+use std::pin::Pin;
+use std::task::{Context, Poll};
 use lance_arrow::DataTypeExt;
 use lance_core::cache::LanceCache;
 use lance_core::datatypes::{Field, Schema, BLOB_DESC_LANCE_FIELD};
@@ -231,6 +233,7 @@ use log::{debug, trace, warn};
 use snafu::location;
 use tokio::sync::mpsc::error::SendError;
 use tokio::sync::mpsc::{self, unbounded_channel};
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
 use lance_core::{ArrowResult, Error, Result};
 use tracing::instrument;
@@ -1090,6 +1093,7 @@ impl DecodeBatchScheduler {
                 if !schedule_action(Ok(DecoderMessage {
                     scheduled_so_far: num_rows_scheduled,
                     decoders: next_scan_line.decoders,
+                    backpressure_permit: None,
                 })) {
                     // Decoder has disconnected
                     return;
@@ -1152,6 +1156,7 @@ impl DecodeBatchScheduler {
             if !schedule_action(Ok(DecoderMessage {
                 scheduled_so_far: num_rows_scheduled,
                 decoders: next_scan_line.decoders,
+                backpressure_permit: None,
             })) {
                 // Decoder has disconnected
                 return;
@@ -1285,7 +1290,7 @@ impl DecodeBatchScheduler {
     }
 
     // coalesce continuous indices if possible (the input indices must be sorted and non-empty)
-    fn indices_to_ranges(indices: &[u64]) -> Vec<Range<u64>> {
+    pub(crate) fn indices_to_ranges(indices: &[u64]) -> Vec<Range<u64>> {
         let mut ranges = Vec::new();
         let mut start = indices[0];
 
@@ -1833,6 +1838,16 @@ pub struct SchedulerDecoderConfig {
     pub cache: Arc<LanceCache>,
     /// Decoder configuration
     pub decoder_config: DecoderConfig,
+    /// Optional semaphore for backpressure between the scheduler and decoder.
+    ///
+    /// When provided, the scheduler acquires one permit before sending each
+    /// `DecoderMessage`. The permit is attached to the message and released
+    /// when the message is dropped (after decoding). This prevents the scheduler
+    /// from racing too far ahead of the decoder when I/O is fast (e.g., cache hits).
+    ///
+    /// The caller controls the semaphore's capacity and lifetime, allowing
+    /// external systems to tune backpressure per-scan, per-dataset, or globally.
+    pub backpressure_semaphore: Option<Arc<Semaphore>>,
 }
 
 fn check_scheduler_on_drop(
@@ -1915,6 +1930,30 @@ pub fn create_decode_iterator(
     }
 }
 
+/// A wrapper around a decode stream that closes the backpressure semaphore when dropped.
+/// This ensures the scheduler task can exit cleanly when the decoder is done or dropped,
+/// rather than blocking forever waiting for permits.
+struct BoundedDecodeStream {
+    inner: BoxStream<'static, ReadBatchTask>,
+    semaphore: Arc<Semaphore>,
+}
+
+impl Stream for BoundedDecodeStream {
+    type Item = ReadBatchTask;
+
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        self.inner.as_mut().poll_next(cx)
+    }
+}
+
+impl Drop for BoundedDecodeStream {
+    fn drop(&mut self) {
+        // Close the semaphore to unblock the scheduler if it's waiting for permits.
+        // This allows the scheduler task to exit cleanly.
+        self.semaphore.close();
+    }
+}
+
 fn create_scheduler_decoder(
     column_infos: Vec<Arc<ColumnInfo>>,
     requested_rows: RequestedRows,
@@ -1926,6 +1965,8 @@ fn create_scheduler_decoder(
     let num_rows = requested_rows.num_rows();
 
     let is_structural = column_infos[0].is_structural();
+
+    let backpressure_semaphore = config.backpressure_semaphore.clone();
 
     let (tx, rx) = mpsc::unbounded_channel();
 
@@ -1960,17 +2001,95 @@ fn create_scheduler_decoder(
             }
         };
 
-        match requested_rows {
-            RequestedRows::Ranges(ranges) => {
-                decode_scheduler.schedule_ranges(&ranges, &filter, tx, config.io)
+        if let Some(ref semaphore) = config.backpressure_semaphore {
+            // Backpressure path: schedule ranges to vec, then send with permits.
+            // This ensures the scheduler doesn't race ahead of the decoder when
+            // I/O is fast (e.g., cache hits).
+            match requested_rows {
+                RequestedRows::Ranges(ranges) => {
+                    for range in &ranges {
+                        let messages = decode_scheduler
+                            .schedule_ranges_to_vec(std::slice::from_ref(range), &filter, config.io.clone(), None)
+                            .map(|msgs| msgs.into_iter().map(Ok).collect::<Vec<_>>())
+                            .unwrap_or_else(|e| vec![Err(e)]);
+                        for msg in messages {
+                            let permit = match semaphore.clone().acquire_owned().await {
+                                Ok(permit) => Some(permit),
+                                Err(_) => {
+                                    debug!(
+                                        "create_scheduler_decoder aborting early since semaphore was closed"
+                                    );
+                                    return;
+                                }
+                            };
+                            let msg_with_permit = msg.map(|m| DecoderMessage {
+                                scheduled_so_far: m.scheduled_so_far,
+                                decoders: m.decoders,
+                                backpressure_permit: permit,
+                            });
+                            if tx.send(msg_with_permit).is_err() {
+                                debug!(
+                                    "create_scheduler_decoder aborting early since decoder appears to have been dropped"
+                                );
+                                return;
+                            }
+                        }
+                    }
+                }
+                RequestedRows::Indices(indices) => {
+                    let ranges = DecodeBatchScheduler::indices_to_ranges(&indices);
+                    let messages = decode_scheduler
+                        .schedule_ranges_to_vec(&ranges, &filter, config.io.clone(), None)
+                        .map(|msgs| msgs.into_iter().map(Ok).collect::<Vec<_>>())
+                        .unwrap_or_else(|e| vec![Err(e)]);
+                    for msg in messages {
+                        let permit = match semaphore.clone().acquire_owned().await {
+                            Ok(permit) => Some(permit),
+                            Err(_) => {
+                                debug!(
+                                    "create_scheduler_decoder aborting early since semaphore was closed"
+                                );
+                                return;
+                            }
+                        };
+                        let msg_with_permit = msg.map(|m| DecoderMessage {
+                            scheduled_so_far: m.scheduled_so_far,
+                            decoders: m.decoders,
+                            backpressure_permit: permit,
+                        });
+                        if tx.send(msg_with_permit).is_err() {
+                            debug!(
+                                "create_scheduler_decoder aborting early since decoder appears to have been dropped"
+                            );
+                            return;
+                        }
+                    }
+                }
             }
-            RequestedRows::Indices(indices) => {
-                decode_scheduler.schedule_take(&indices, &filter, tx, config.io)
+        } else {
+            // Standard path: no backpressure, schedule directly to channel.
+            match requested_rows {
+                RequestedRows::Ranges(ranges) => {
+                    decode_scheduler.schedule_ranges(&ranges, &filter, tx, config.io)
+                }
+                RequestedRows::Indices(indices) => {
+                    decode_scheduler.schedule_take(&indices, &filter, tx, config.io)
+                }
             }
         }
     });
 
-    Ok(check_scheduler_on_drop(decode_stream, scheduler_handle))
+    let inner_stream = check_scheduler_on_drop(decode_stream, scheduler_handle);
+
+    if let Some(semaphore) = backpressure_semaphore {
+        Ok(BoundedDecodeStream {
+            inner: inner_stream,
+            semaphore,
+        }
+        .boxed())
+    } else {
+        Ok(inner_stream)
+    }
 }
 
 /// Launches a scheduler on a dedicated (spawned) task and creates a decoder to
@@ -2521,6 +2640,11 @@ impl MessageType {
 pub struct DecoderMessage {
     pub scheduled_so_far: u64,
     pub decoders: Vec<MessageType>,
+    /// Optional backpressure permit. When present, this permit is held until the
+    /// message is dropped (i.e., after the decoder has processed it). This
+    /// prevents the scheduler from racing too far ahead of the decoder.
+    #[allow(dead_code)]
+    backpressure_permit: Option<OwnedSemaphorePermit>,
 }
 
 pub struct DecoderContext {
