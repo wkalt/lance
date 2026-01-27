@@ -8,7 +8,6 @@ use std::{
     pin::Pin,
     sync::Arc,
 };
-use tokio::sync::Semaphore;
 
 use arrow_array::RecordBatchReader;
 use arrow_schema::Schema as ArrowSchema;
@@ -335,12 +334,11 @@ pub struct FileReaderOptions {
     /// will be read in multiple chunks to control memory usage.
     /// Default: 8MB (DEFAULT_READ_CHUNK_SIZE)
     pub read_chunk_size: u64,
-    /// Optional semaphore for backpressure between the scheduler and decoder.
-    ///
-    /// When provided, the scheduler acquires one permit before sending each
-    /// decoded batch. This prevents the scheduler from racing ahead of the
-    /// decoder when I/O is fast (e.g., cache hits), limiting memory consumption.
-    pub backpressure_semaphore: Option<Arc<Semaphore>>,
+    /// Capacity of the decode channel for backpressure.
+    /// When set, creates a per-scan semaphore that limits how much I/O the
+    /// scheduler can submit ahead of the decoder, limiting memory consumption.
+    /// Recommended value: 2-4.
+    pub decode_channel_capacity: Option<usize>,
 }
 
 impl Default for FileReaderOptions {
@@ -348,7 +346,7 @@ impl Default for FileReaderOptions {
         Self {
             decoder_config: DecoderConfig::default(),
             read_chunk_size: DEFAULT_READ_CHUNK_SIZE,
-            backpressure_semaphore: None,
+            decode_channel_capacity: None,
         }
     }
 }
@@ -878,7 +876,7 @@ impl FileReader {
         projection: ReaderProjection,
         filter: FilterExpression,
         decoder_config: DecoderConfig,
-        backpressure_semaphore: Option<Arc<Semaphore>>,
+        decode_channel_capacity: Option<usize>,
     ) -> Result<BoxStream<'static, ReadBatchTask>> {
         debug!(
             "Reading range {:?} with batch_size {} from file with {} rows and {} columns into schema with {} columns",
@@ -895,7 +893,7 @@ impl FileReader {
             decoder_plugins,
             io,
             decoder_config,
-            backpressure_semaphore,
+            decode_channel_capacity,
         };
 
         let requested_rows = RequestedRows::Ranges(vec![range]);
@@ -929,7 +927,7 @@ impl FileReader {
             projection,
             filter,
             self.options.decoder_config.clone(),
-            self.options.backpressure_semaphore.clone(),
+            self.options.decode_channel_capacity,
         )
     }
 
@@ -944,7 +942,7 @@ impl FileReader {
         projection: ReaderProjection,
         filter: FilterExpression,
         decoder_config: DecoderConfig,
-        backpressure_semaphore: Option<Arc<Semaphore>>,
+        decode_channel_capacity: Option<usize>,
     ) -> Result<BoxStream<'static, ReadBatchTask>> {
         debug!(
             "Taking {} rows spread across range {}..{} with batch_size {} from columns {:?}",
@@ -961,7 +959,7 @@ impl FileReader {
             decoder_plugins,
             io,
             decoder_config,
-            backpressure_semaphore,
+            decode_channel_capacity,
         };
 
         let requested_rows = RequestedRows::Indices(indices);
@@ -993,7 +991,7 @@ impl FileReader {
             projection,
             FilterExpression::no_filter(),
             self.options.decoder_config.clone(),
-            self.options.backpressure_semaphore.clone(),
+            self.options.decode_channel_capacity,
         )
     }
 
@@ -1008,7 +1006,7 @@ impl FileReader {
         projection: ReaderProjection,
         filter: FilterExpression,
         decoder_config: DecoderConfig,
-        backpressure_semaphore: Option<Arc<Semaphore>>,
+        decode_channel_capacity: Option<usize>,
     ) -> Result<BoxStream<'static, ReadBatchTask>> {
         let num_rows = ranges.iter().map(|r| r.end - r.start).sum::<u64>();
         debug!(
@@ -1027,7 +1025,7 @@ impl FileReader {
             decoder_plugins,
             io,
             decoder_config,
-            backpressure_semaphore,
+            decode_channel_capacity,
         };
 
         let requested_rows = RequestedRows::Ranges(ranges);
@@ -1059,7 +1057,7 @@ impl FileReader {
             projection,
             filter,
             self.options.decoder_config.clone(),
-            self.options.backpressure_semaphore.clone(),
+            self.options.decode_channel_capacity,
         )
     }
 
@@ -1213,7 +1211,7 @@ impl FileReader {
             decoder_plugins: self.decoder_plugins.clone(),
             io: self.scheduler.clone(),
             decoder_config: self.options.decoder_config.clone(),
-            backpressure_semaphore: self.options.backpressure_semaphore.clone(),
+            decode_channel_capacity: self.options.decode_channel_capacity,
         };
 
         let requested_rows = RequestedRows::Indices(indices);
@@ -1253,7 +1251,7 @@ impl FileReader {
             decoder_plugins: self.decoder_plugins.clone(),
             io: self.scheduler.clone(),
             decoder_config: self.options.decoder_config.clone(),
-            backpressure_semaphore: self.options.backpressure_semaphore.clone(),
+            decode_channel_capacity: self.options.decode_channel_capacity,
         };
 
         let requested_rows = RequestedRows::Ranges(ranges);
@@ -1293,7 +1291,7 @@ impl FileReader {
             decoder_plugins: self.decoder_plugins.clone(),
             io: self.scheduler.clone(),
             decoder_config: self.options.decoder_config.clone(),
-            backpressure_semaphore: self.options.backpressure_semaphore.clone(),
+            decode_channel_capacity: self.options.decode_channel_capacity,
         };
 
         let requested_rows = RequestedRows::Ranges(vec![range]);
