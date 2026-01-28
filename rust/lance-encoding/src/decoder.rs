@@ -231,6 +231,7 @@ use log::{debug, trace, warn};
 use snafu::location;
 use tokio::sync::mpsc::error::SendError;
 use tokio::sync::mpsc::{self, unbounded_channel};
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
 use lance_core::{ArrowResult, Error, Result};
 use tracing::instrument;
@@ -1090,6 +1091,7 @@ impl DecodeBatchScheduler {
                 if !schedule_action(Ok(DecoderMessage {
                     scheduled_so_far: num_rows_scheduled,
                     decoders: next_scan_line.decoders,
+                    backpressure_permit: None,
                 })) {
                     // Decoder has disconnected
                     return;
@@ -1152,6 +1154,7 @@ impl DecodeBatchScheduler {
             if !schedule_action(Ok(DecoderMessage {
                 scheduled_so_far: num_rows_scheduled,
                 decoders: next_scan_line.decoders,
+                backpressure_permit: None,
             })) {
                 // Decoder has disconnected
                 return;
@@ -1285,7 +1288,7 @@ impl DecodeBatchScheduler {
     }
 
     // coalesce continuous indices if possible (the input indices must be sorted and non-empty)
-    fn indices_to_ranges(indices: &[u64]) -> Vec<Range<u64>> {
+    pub fn indices_to_ranges(indices: &[u64]) -> Vec<Range<u64>> {
         let mut ranges = Vec::new();
         let mut start = indices[0];
 
@@ -1335,8 +1338,31 @@ impl BatchDecodeStream {
         num_rows: u64,
         root_decoder: SimpleStructDecoder,
     ) -> Self {
+        Self::with_context(DecoderContext::new(scheduled), rows_per_batch, num_rows, root_decoder)
+    }
+
+    pub fn new_bounded(
+        scheduled: mpsc::Receiver<Result<DecoderMessage>>,
+        rows_per_batch: u32,
+        num_rows: u64,
+        root_decoder: SimpleStructDecoder,
+    ) -> Self {
+        Self::with_context(
+            DecoderContext::new_bounded(scheduled),
+            rows_per_batch,
+            num_rows,
+            root_decoder,
+        )
+    }
+
+    fn with_context(
+        context: DecoderContext,
+        rows_per_batch: u32,
+        num_rows: u64,
+        root_decoder: SimpleStructDecoder,
+    ) -> Self {
         Self {
-            context: DecoderContext::new(scheduled),
+            context,
             root_decoder,
             rows_remaining: num_rows,
             rows_per_batch,
@@ -1681,8 +1707,31 @@ impl StructuralBatchDecodeStream {
         num_rows: u64,
         root_decoder: StructuralStructDecoder,
     ) -> Self {
+        Self::with_context(DecoderContext::new(scheduled), rows_per_batch, num_rows, root_decoder)
+    }
+
+    pub fn new_bounded(
+        scheduled: mpsc::Receiver<Result<DecoderMessage>>,
+        rows_per_batch: u32,
+        num_rows: u64,
+        root_decoder: StructuralStructDecoder,
+    ) -> Self {
+        Self::with_context(
+            DecoderContext::new_bounded(scheduled),
+            rows_per_batch,
+            num_rows,
+            root_decoder,
+        )
+    }
+
+    fn with_context(
+        context: DecoderContext,
+        rows_per_batch: u32,
+        num_rows: u64,
+        root_decoder: StructuralStructDecoder,
+    ) -> Self {
         Self {
-            context: DecoderContext::new(scheduled),
+            context,
             root_decoder,
             rows_remaining: num_rows,
             rows_per_batch,
@@ -1833,6 +1882,13 @@ pub struct SchedulerDecoderConfig {
     pub cache: Arc<LanceCache>,
     /// Decoder configuration
     pub decoder_config: DecoderConfig,
+    /// If set, limits how many decoded batches can be buffered between the
+    /// scheduler and the decoder.  This provides backpressure to prevent the
+    /// scheduler from racing too far ahead of the decoder, which can cause
+    /// memory explosion when storage is fast (e.g. memory cache).
+    ///
+    /// When `None`, an unbounded channel is used (the default / existing behavior).
+    pub decode_channel_capacity: Option<usize>,
 }
 
 fn check_scheduler_on_drop(
@@ -1880,6 +1936,34 @@ pub fn create_decode_stream(
     }
 }
 
+/// Like [`create_decode_stream`] but uses a bounded channel for backpressure.
+pub fn create_decode_stream_bounded(
+    schema: &Schema,
+    num_rows: u64,
+    batch_size: u32,
+    is_structural: bool,
+    should_validate: bool,
+    rx: mpsc::Receiver<Result<DecoderMessage>>,
+) -> BoxStream<'static, ReadBatchTask> {
+    if is_structural {
+        let arrow_schema = ArrowSchema::from(schema);
+        let structural_decoder = StructuralStructDecoder::new(
+            arrow_schema.fields,
+            should_validate,
+            /*is_root=*/ true,
+        );
+        StructuralBatchDecodeStream::new_bounded(rx, batch_size, num_rows, structural_decoder)
+            .into_stream()
+    } else {
+        let arrow_schema = ArrowSchema::from(schema);
+        let root_fields = arrow_schema.fields;
+
+        let simple_struct_decoder = SimpleStructDecoder::new(root_fields, num_rows);
+        BatchDecodeStream::new_bounded(rx, batch_size, num_rows, simple_struct_decoder)
+            .into_stream()
+    }
+}
+
 /// Creates a iterator that decodes a set of messages in a blocking fashion
 ///
 /// See [`schedule_and_decode_blocking`] for more information.
@@ -1916,6 +2000,36 @@ pub fn create_decode_iterator(
 }
 
 fn create_scheduler_decoder(
+    column_infos: Vec<Arc<ColumnInfo>>,
+    requested_rows: RequestedRows,
+    filter: FilterExpression,
+    column_indices: Vec<u32>,
+    target_schema: Arc<Schema>,
+    config: SchedulerDecoderConfig,
+) -> Result<BoxStream<'static, ReadBatchTask>> {
+    if let Some(capacity) = config.decode_channel_capacity {
+        create_scheduler_decoder_bounded(
+            column_infos,
+            requested_rows,
+            filter,
+            column_indices,
+            target_schema,
+            config,
+            capacity,
+        )
+    } else {
+        create_scheduler_decoder_unbounded(
+            column_infos,
+            requested_rows,
+            filter,
+            column_indices,
+            target_schema,
+            config,
+        )
+    }
+}
+
+fn create_scheduler_decoder_unbounded(
     column_infos: Vec<Arc<ColumnInfo>>,
     requested_rows: RequestedRows,
     filter: FilterExpression,
@@ -1971,6 +2085,117 @@ fn create_scheduler_decoder(
     });
 
     Ok(check_scheduler_on_drop(decode_stream, scheduler_handle))
+}
+
+fn create_scheduler_decoder_bounded(
+    column_infos: Vec<Arc<ColumnInfo>>,
+    requested_rows: RequestedRows,
+    filter: FilterExpression,
+    column_indices: Vec<u32>,
+    target_schema: Arc<Schema>,
+    config: SchedulerDecoderConfig,
+    capacity: usize,
+) -> Result<BoxStream<'static, ReadBatchTask>> {
+    let num_rows = requested_rows.num_rows();
+    let is_structural = column_infos[0].is_structural();
+
+    let semaphore = Arc::new(Semaphore::new(capacity));
+    let semaphore_for_scheduler = semaphore.clone();
+    // We still use an unbounded channel so that the sync scheduling callback
+    // can always send without blocking.  Backpressure is enforced by the
+    // semaphore: the scheduler must acquire a permit before each scheduling
+    // round, and the permit is attached to the DecoderMessage so it is
+    // released when the decoder drops the message.
+    let (tx, rx) = mpsc::unbounded_channel();
+
+    let decode_stream = create_decode_stream(
+        &target_schema,
+        num_rows,
+        config.batch_size,
+        is_structural,
+        config.decoder_config.validate_on_decode,
+        rx,
+    );
+
+    let scheduler_handle = tokio::task::spawn(async move {
+        let mut decode_scheduler = match DecodeBatchScheduler::try_new(
+            target_schema.as_ref(),
+            &column_indices,
+            &column_infos,
+            &vec![],
+            num_rows,
+            config.decoder_plugins,
+            config.io.clone(),
+            config.cache,
+            &filter,
+            &config.decoder_config,
+        )
+        .await
+        {
+            Ok(scheduler) => scheduler,
+            Err(e) => {
+                let _ = tx.send(Err(e));
+                return;
+            }
+        };
+
+        // Collect all messages from the scheduler synchronously (no I/O backpressure
+        // at the scheduling level), then forward them one-by-one through the
+        // semaphore-gated channel.
+        //
+        // Note: schedule_ranges_to_vec issues I/O as it schedules, but the actual
+        // data arrives asynchronously.  The semaphore prevents the decoder from
+        // falling too far behind the scheduler, which limits how much decoded data
+        // can accumulate in memory.
+        let ranges = match requested_rows {
+            RequestedRows::Ranges(ranges) => ranges,
+            RequestedRows::Indices(indices) => DecodeBatchScheduler::indices_to_ranges(&indices),
+        };
+
+        let messages = match decode_scheduler.schedule_ranges_to_vec(
+            &ranges,
+            &filter,
+            config.io,
+            None,
+        ) {
+            Ok(msgs) => msgs,
+            Err(e) => {
+                let _ = tx.send(Err(e));
+                return;
+            }
+        };
+
+        for msg in messages {
+            // Acquire a semaphore permit before sending.  This blocks (async)
+            // if the decoder hasn't consumed earlier messages yet.
+            let permit = match semaphore_for_scheduler.clone().acquire_owned().await {
+                Ok(permit) => permit,
+                Err(_) => {
+                    // Semaphore closed — decoder was dropped
+                    return;
+                }
+            };
+            let bounded_msg = DecoderMessage {
+                scheduled_so_far: msg.scheduled_so_far,
+                decoders: msg.decoders,
+                backpressure_permit: Some(permit),
+            };
+            if tx.send(Ok(bounded_msg)).is_err() {
+                // Decoder dropped
+                return;
+            }
+        }
+    });
+
+    // When the stream is dropped, close the semaphore so the scheduler
+    // task can exit promptly instead of blocking on acquire.
+    let semaphore_for_drop = semaphore.clone();
+    let decode_stream = check_scheduler_on_drop(decode_stream, scheduler_handle);
+    let decode_stream = decode_stream.finally(move || {
+        semaphore_for_drop.close();
+    });
+
+    Ok(decode_stream.boxed())
 }
 
 /// Launches a scheduler on a dedicated (spawned) task and creates a decoder to
@@ -2521,15 +2746,42 @@ impl MessageType {
 pub struct DecoderMessage {
     pub scheduled_so_far: u64,
     pub decoders: Vec<MessageType>,
+    /// When set, this permit is held while the message is in-flight.
+    /// Dropping the message releases the permit, allowing the scheduler
+    /// to send more messages.  Used for backpressure.
+    pub backpressure_permit: Option<OwnedSemaphorePermit>,
+}
+
+/// Wraps either an unbounded or bounded receiver for decoder messages.
+pub enum DecoderReceiver {
+    Unbounded(mpsc::UnboundedReceiver<Result<DecoderMessage>>),
+    Bounded(mpsc::Receiver<Result<DecoderMessage>>),
+}
+
+impl DecoderReceiver {
+    pub async fn recv(&mut self) -> Option<Result<DecoderMessage>> {
+        match self {
+            Self::Unbounded(rx) => rx.recv().await,
+            Self::Bounded(rx) => rx.recv().await,
+        }
+    }
 }
 
 pub struct DecoderContext {
-    source: mpsc::UnboundedReceiver<Result<DecoderMessage>>,
+    source: DecoderReceiver,
 }
 
 impl DecoderContext {
     pub fn new(source: mpsc::UnboundedReceiver<Result<DecoderMessage>>) -> Self {
-        Self { source }
+        Self {
+            source: DecoderReceiver::Unbounded(source),
+        }
+    }
+
+    pub fn new_bounded(source: mpsc::Receiver<Result<DecoderMessage>>) -> Self {
+        Self {
+            source: DecoderReceiver::Bounded(source),
+        }
     }
 }
 

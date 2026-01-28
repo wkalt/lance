@@ -27,6 +27,7 @@ use lance_arrow::SchemaExt;
 use lance_core::utils::tokio::get_num_compute_intensive_cpus;
 use lance_core::utils::tracing::StreamTracingExt;
 use lance_core::{Error, ROW_ADDR_FIELD, ROW_ID_FIELD};
+use lance_file::reader::FileReaderOptions;
 use lance_io::scheduler::{ScanScheduler, SchedulerConfig};
 use lance_table::format::Fragment;
 use log::debug;
@@ -287,16 +288,25 @@ impl LanceStream {
                     Result<BoxStream<Result<BoxFuture<Result<RecordBatch>>>>>,
                 > = tokio::spawn(
                     (async move {
+                        let mut frag_config = FragReadConfig::default()
+                            .with_row_id(config.with_row_id)
+                            .with_row_address(config.with_row_address)
+                            .with_row_last_updated_at_version(
+                                config.with_row_last_updated_at_version,
+                            )
+                            .with_row_created_at_version(config.with_row_created_at_version);
+                        if let Some(cap) = config.decode_channel_capacity {
+                            frag_config = frag_config.with_file_reader_options(
+                                FileReaderOptions {
+                                    decode_channel_capacity: Some(cap),
+                                    ..FileReaderOptions::default()
+                                },
+                            );
+                        }
                         let reader = open_file(
                             file_fragment.fragment,
                             project_schema,
-                            FragReadConfig::default()
-                                .with_row_id(config.with_row_id)
-                                .with_row_address(config.with_row_address)
-                                .with_row_last_updated_at_version(
-                                    config.with_row_last_updated_at_version,
-                                )
-                                .with_row_created_at_version(config.with_row_created_at_version),
+                            frag_config,
                             config.with_make_deletions_null,
                             Some((scan_scheduler, priority as u32)),
                         )
@@ -503,6 +513,10 @@ pub struct LanceScanConfig {
     pub with_row_created_at_version: bool,
     pub with_make_deletions_null: bool,
     pub ordered_output: bool,
+    /// If set, limits how many decoded batches can be buffered between the
+    /// scheduler and the decoder per file, providing backpressure to control
+    /// memory usage during scans.
+    pub decode_channel_capacity: Option<usize>,
 }
 
 // This is mostly for testing purposes, end users are unlikely to create this
@@ -520,6 +534,7 @@ impl Default for LanceScanConfig {
             with_row_created_at_version: false,
             with_make_deletions_null: false,
             ordered_output: false,
+            decode_channel_capacity: None,
         }
     }
 }
