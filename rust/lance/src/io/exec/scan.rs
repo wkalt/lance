@@ -278,6 +278,7 @@ impl LanceStream {
 
         let scan_scheduler_clone = scan_scheduler.clone();
 
+        let batch_readahead = config.batch_readahead;
         let batches = stream::iter(file_fragments.into_iter().enumerate())
             .map(move |(priority, file_fragment)| {
                 let project_schema = project_schema.clone();
@@ -336,7 +337,7 @@ impl LanceStream {
             // TODO: Ideally this will eventually get tied into datafusion as a # of partitions.  This will let
             // us fully fuse decode into the first half of the plan.  Currently there is likely to be a thread
             // transfer between the two steps.
-            .try_buffered(get_num_compute_intensive_cpus())
+            .try_buffered(batch_readahead)
             .stream_in_current_span()
             .boxed();
 
