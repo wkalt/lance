@@ -107,7 +107,10 @@ impl PageScheduler for ValuePageScheduler {
         let compression_config = self.compression_config;
         async move {
             let bytes = bytes.await?;
-            let bytes: Vec<Bytes> = bytes.into_iter().map(concat_segments).collect();
+            // Flatten segments from all ranges into a single Vec<Bytes>.
+            // decode_buffers already iterates across multiple buffers, so
+            // passing individual cache-page segments avoids a contiguous copy.
+            let bytes: Vec<Bytes> = bytes.into_iter().flatten().collect();
 
             Ok(Box::new(ValuePageDecoder {
                 bytes_per_value,
@@ -132,7 +135,8 @@ struct ValuePageDecoder {
 impl ValuePageDecoder {
     fn decompress(&self) -> Result<Vec<Bytes>> {
         // for compressed page, it is guaranteed that only one range is passed
-        let bytes_u8: Vec<u8> = self.data[0].to_vec();
+        // but self.data may contain multiple segments from the page cache
+        let bytes_u8: Vec<u8> = concat_segments(self.data.clone()).to_vec();
         let buffer_compressor = GeneralBufferCompressor::get_compressor(self.compression_config)?;
         let mut uncompressed_bytes: Vec<u8> = Vec::new();
         buffer_compressor.decompress(&bytes_u8, &mut uncompressed_bytes)?;
