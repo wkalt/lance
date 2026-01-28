@@ -50,9 +50,10 @@ use crate::{
     writer::PAGE_BUFFER_ALIGNMENT,
 };
 
-/// Default chunk size for reading large pages (8MiB)
-/// Pages larger than this will be split into multiple chunks during read
-pub const DEFAULT_READ_CHUNK_SIZE: u64 = 8 * 1024 * 1024;
+/// Default chunk size for reading large pages (32MiB)
+/// Pages larger than this will be split into multiple chunks during read.
+/// 32MB avoids splitting for typical vector column reads (8-16MB).
+pub const DEFAULT_READ_CHUNK_SIZE: u64 = 32 * 1024 * 1024;
 
 // For now, we don't use global buffers for anything other than schema.  If we
 // use these later we should make them lazily loaded and then cached once loaded.
