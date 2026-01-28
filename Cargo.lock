@@ -5007,6 +5007,7 @@ dependencies = [
  "byteorder",
  "bytes",
  "criterion",
+ "crossbeam-queue",
  "datafusion-common",
  "deepsize",
  "futures",
