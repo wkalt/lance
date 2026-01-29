@@ -209,6 +209,10 @@ impl ObjectStoreRegistry {
 
         if let Some(wrapper) = &params.object_store_wrapper {
             store.inner = wrapper.wrap(&cache_path, store.inner);
+            // Apply I/O parallelism override if the wrapper specifies one
+            if let Some(io_parallelism) = wrapper.io_parallelism_override() {
+                store.io_parallelism = io_parallelism;
+            }
         }
 
         // Always wrap with IO tracking

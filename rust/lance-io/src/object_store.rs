@@ -156,6 +156,17 @@ pub trait WrappingObjectStore: std::fmt::Debug + Send + Sync {
     /// The store_prefix is a string which uniquely identifies the object
     /// store being wrapped.
     fn wrap(&self, store_prefix: &str, original: Arc<dyn OSObjectStore>) -> Arc<dyn OSObjectStore>;
+
+    /// Override the I/O parallelism for the wrapped object store.
+    ///
+    /// This allows wrappers like caching layers to specify a different I/O parallelism
+    /// than the underlying store. For example, a memory cache might want lower parallelism
+    /// since it doesn't need to saturate network bandwidth.
+    ///
+    /// Returns `None` to use the default parallelism from the underlying store.
+    fn io_parallelism_override(&self) -> Option<usize> {
+        None
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -178,6 +189,15 @@ impl WrappingObjectStore for ChainedWrappingObjectStore {
         self.wrappers
             .iter()
             .fold(original, |acc, wrapper| wrapper.wrap(store_prefix, acc))
+    }
+
+    fn io_parallelism_override(&self) -> Option<usize> {
+        // Return the minimum override from any wrapper in the chain,
+        // or None if no wrapper specifies an override
+        self.wrappers
+            .iter()
+            .filter_map(|w| w.io_parallelism_override())
+            .min()
     }
 }
 
@@ -429,9 +449,13 @@ impl ObjectStore {
             let mut inner = store.clone();
             let store_prefix =
                 registry.calculate_object_store_prefix(uri, params.storage_options())?;
-            if let Some(wrapper) = params.object_store_wrapper.as_ref() {
+            let io_parallelism_override = if let Some(wrapper) = params.object_store_wrapper.as_ref()
+            {
                 inner = wrapper.wrap(&store_prefix, inner);
-            }
+                wrapper.io_parallelism_override()
+            } else {
+                None
+            };
 
             // Always wrap with IO tracking
             let io_tracker = IOTracker::default();
@@ -444,7 +468,7 @@ impl ObjectStore {
                 max_iop_size: *DEFAULT_MAX_IOP_SIZE,
                 use_constant_size_upload_parts: params.use_constant_size_upload_parts,
                 list_is_lexically_ordered: params.list_is_lexically_ordered.unwrap_or_default(),
-                io_parallelism: DEFAULT_CLOUD_IO_PARALLELISM,
+                io_parallelism: io_parallelism_override.unwrap_or(DEFAULT_CLOUD_IO_PARALLELISM),
                 download_retry_count: DEFAULT_DOWNLOAD_RETRY_COUNT,
                 io_tracker,
                 store_prefix: String::new(), // custom object store, no prefix needed
