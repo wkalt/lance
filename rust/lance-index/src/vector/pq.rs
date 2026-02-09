@@ -14,7 +14,7 @@ use deepsize::DeepSizeOf;
 use distance::build_distance_table_dot;
 use lance_arrow::*;
 use lance_core::{assume_eq, Error, Result};
-use lance_linalg::distance::{DistanceType, Dot, L2};
+use lance_linalg::distance::{l2::L2Targets, DistanceType, Dot, L2};
 use lance_table::utils::LanceIteratorExtension;
 use num_traits::Float;
 use prost::Message;
@@ -28,7 +28,7 @@ pub mod storage;
 pub mod transform;
 pub(crate) mod utils;
 
-use self::distance::{build_distance_table_l2, compute_pq_distance};
+use self::distance::{build_distance_table_l2, build_distance_table_l2_prepared, compute_pq_distance};
 pub use self::utils::num_centroids;
 use super::quantizer::{
     Quantization, QuantizationMetadata, QuantizationType, Quantizer, QuantizerBuildParams,
@@ -45,6 +45,9 @@ pub struct ProductQuantizer {
     pub dimension: usize,
     pub codebook: FixedSizeListArray,
     pub distance_type: DistanceType,
+    /// Pre-transposed L2 targets per sub-vector for fast f32 L2 batch computation.
+    /// Only populated when codebook is f32 and distance_type is L2.
+    l2_targets: Option<Vec<L2Targets>>,
 }
 
 impl DeepSizeOf for ProductQuantizer {
@@ -54,10 +57,43 @@ impl DeepSizeOf for ProductQuantizer {
             + self.num_bits.deep_size_of_children(_context)
             + self.dimension.deep_size_of_children(_context)
             + self.distance_type.deep_size_of_children(_context)
+            + self
+                .l2_targets
+                .as_ref()
+                .map_or(0, |v| v.iter().map(|t| t.size_bytes()).sum())
     }
 }
 
 impl ProductQuantizer {
+    /// Build per-sub-vector L2Targets from the codebook if applicable (f32 + L2).
+    fn build_l2_targets(
+        codebook: &FixedSizeListArray,
+        distance_type: DistanceType,
+        num_sub_vectors: usize,
+        num_bits: u32,
+        dimension: usize,
+    ) -> Option<Vec<L2Targets>> {
+        if codebook.value_type() != DataType::Float32 || distance_type != DistanceType::L2 {
+            return None;
+        }
+        let values = codebook
+            .values()
+            .as_primitive::<datatypes::Float32Type>()
+            .values();
+        let sub_dim = dimension / num_sub_vectors;
+        let num_centroids = 2_usize.pow(num_bits);
+        let block_size = sub_dim * num_centroids;
+
+        let targets = (0..num_sub_vectors)
+            .map(|sub_idx| {
+                let block_start = sub_idx * block_size;
+                let block = &values[block_start..block_start + block_size];
+                L2Targets::new(block, sub_dim)
+            })
+            .collect();
+        Some(targets)
+    }
+
     pub fn new(
         num_sub_vectors: usize,
         num_bits: u32,
@@ -65,12 +101,20 @@ impl ProductQuantizer {
         codebook: FixedSizeListArray,
         distance_type: DistanceType,
     ) -> Self {
+        let l2_targets = Self::build_l2_targets(
+            &codebook,
+            distance_type,
+            num_sub_vectors,
+            num_bits,
+            dimension,
+        );
         Self {
             num_bits,
             num_sub_vectors,
             dimension,
             codebook,
             distance_type,
+            l2_targets,
         }
     }
 
@@ -86,13 +130,13 @@ impl ProductQuantizer {
                 proto.dimension as i32,
             )?,
         };
-        Ok(Self {
-            num_bits: proto.num_bits,
-            num_sub_vectors: proto.num_sub_vectors as usize,
-            dimension: proto.dimension as usize,
+        Ok(Self::new(
+            proto.num_sub_vectors as usize,
+            proto.num_bits,
+            proto.dimension as usize,
             codebook,
             distance_type,
-        })
+        ))
     }
 
     #[instrument(name = "ProductQuantizer::transform", level = "debug", skip_all)]
@@ -144,38 +188,76 @@ impl ProductQuantizer {
 
         let flatten_data = fsl.values().as_primitive::<T>();
         let sub_dim = dim / num_sub_vectors;
+        let num_centroids = 2_usize.pow(NUM_BITS);
         let total_code_length = fsl.len() * num_sub_vectors / (8 / NUM_BITS as usize);
-        let values = flatten_data
-            .values()
-            .chunks_exact(dim)
-            .flat_map(|vector| {
-                let sub_vec_code = vector
-                    .chunks_exact(sub_dim)
-                    .enumerate()
-                    .map(|(sub_idx, sub_vector)| {
-                        let centroids = get_sub_vector_centroids::<NUM_BITS, _>(
-                            codebook.values(),
-                            dim,
-                            num_sub_vectors,
-                            sub_idx,
-                        );
-                        // SAFETY: The must be 2^NUM_BITS centroids, it's safe to unwrap_or(0),
-                        // this could happen if all distances are INFs in the case of vectors are large.
-                        assume_eq!(centroids.len(), 2_usize.pow(NUM_BITS) * sub_dim);
-                        compute_partition(centroids, sub_vector, distance_type).unwrap_or(0) as u8
-                    })
-                    .collect::<Vec<_>>();
-                if NUM_BITS == 4 {
-                    sub_vec_code
-                        .chunks_exact(2)
-                        .map(|v| (v[1] << 4) | v[0])
-                        .collect::<Vec<_>>()
-                } else {
-                    sub_vec_code
-                }
-            })
-            .exact_size(total_code_length)
-            .collect::<Vec<_>>();
+
+        // Fast path: use pre-transposed L2Targets for f32 L2
+        let values = if let Some(l2_targets) = &self.l2_targets {
+            flatten_data
+                .values()
+                .as_ref()
+                .chunks_exact(dim)
+                .flat_map(|vector| {
+                    // SAFETY: l2_targets is only Some when T::Native is f32
+                    let vector_f32: &[f32] = unsafe {
+                        std::slice::from_raw_parts(
+                            vector.as_ptr() as *const f32,
+                            vector.len(),
+                        )
+                    };
+                    let sub_vec_code = vector_f32
+                        .chunks_exact(sub_dim)
+                        .enumerate()
+                        .map(|(sub_idx, sub_vector)| {
+                            let dists = l2_targets[sub_idx].distances(sub_vector);
+                            lance_linalg::kernels::argmin_value_float(dists.into_iter())
+                                .map(|(idx, _)| idx as u8)
+                                .unwrap_or(0)
+                        })
+                        .collect::<Vec<_>>();
+                    if NUM_BITS == 4 {
+                        sub_vec_code
+                            .chunks_exact(2)
+                            .map(|v| (v[1] << 4) | v[0])
+                            .collect::<Vec<_>>()
+                    } else {
+                        sub_vec_code
+                    }
+                })
+                .exact_size(total_code_length)
+                .collect::<Vec<_>>()
+        } else {
+            flatten_data
+                .values()
+                .chunks_exact(dim)
+                .flat_map(|vector| {
+                    let sub_vec_code = vector
+                        .chunks_exact(sub_dim)
+                        .enumerate()
+                        .map(|(sub_idx, sub_vector)| {
+                            let centroids = get_sub_vector_centroids::<NUM_BITS, _>(
+                                codebook.values(),
+                                dim,
+                                num_sub_vectors,
+                                sub_idx,
+                            );
+                            assume_eq!(centroids.len(), num_centroids * sub_dim);
+                            compute_partition(centroids, sub_vector, distance_type).unwrap_or(0)
+                                as u8
+                        })
+                        .collect::<Vec<_>>();
+                    if NUM_BITS == 4 {
+                        sub_vec_code
+                            .chunks_exact(2)
+                            .map(|v| (v[1] << 4) | v[0])
+                            .collect::<Vec<_>>()
+                    } else {
+                        sub_vec_code
+                    }
+                })
+                .exact_size(total_code_length)
+                .collect::<Vec<_>>()
+        };
 
         let num_sub_vectors_in_byte = if NUM_BITS == 4 {
             num_sub_vectors / 2
@@ -288,6 +370,15 @@ impl ProductQuantizer {
 
     fn build_l2_distance_table(&self, key: &dyn Array) -> Result<Vec<f32>> {
         match key.data_type() {
+            DataType::Float32 if self.l2_targets.is_some() => {
+                let l2_targets = self.l2_targets.as_ref().unwrap();
+                let query = key.as_primitive::<datatypes::Float32Type>().values();
+                Ok(build_distance_table_l2_prepared(
+                    l2_targets,
+                    self.num_sub_vectors,
+                    query,
+                ))
+            }
             DataType::Float16 => {
                 Ok(self.build_l2_distance_table_impl::<datatypes::Float16Type>(key.as_primitive()))
             }
