@@ -270,37 +270,29 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
     // build the index with the all data in the dataset,
     // return the number of indices merged
     pub async fn build(&mut self) -> Result<usize> {
-        let progress = self.progress.clone();
-
         // step 1. train IVF & quantizer
-        let max_iters = self.ivf_params.as_ref().map(|p| p.max_iters as u64);
-        progress
-            .stage_start("train_ivf", max_iters, "iterations")
-            .await?;
         self.with_ivf(self.load_or_build_ivf().await?);
-        progress.stage_complete("train_ivf").await?;
-
-        progress.stage_start("train_quantizer", None, "").await?;
         self.with_quantizer(self.load_or_build_quantizer().await?);
-        progress.stage_complete("train_quantizer").await?;
 
         // step 2. shuffle the dataset
         if self.shuffle_reader.is_none() {
-            progress.stage_start("shuffle", None, "batches").await?;
+            self.progress
+                .stage_start("shuffle", None, "batches")
+                .await?;
             self.shuffle_dataset().await?;
-            progress.stage_complete("shuffle").await?;
+            self.progress.stage_complete("shuffle").await?;
         }
 
         // step 3. build partitions
         let num_partitions = self.ivf.as_ref().map(|ivf| ivf.num_partitions() as u64);
-        progress
+        self.progress
             .stage_start("build_partitions", num_partitions, "partitions")
             .await?;
         let build_idx_stream = self.build_partitions().boxed().await?;
 
         // step 4. merge all partitions
         self.merge_partitions(build_idx_stream).await?;
-        progress.stage_complete("build_partitions").await?;
+        self.progress.stage_complete("build_partitions").await?;
 
         Ok(self.merged_num)
     }
@@ -438,6 +430,9 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
             None => 256 * 256, // here it must be retrain, let's just set sample size to the default value
         };
 
+        self.progress
+            .stage_start("sample_quantizer", Some(sample_size_hint as u64), "rows")
+            .await?;
         let start = std::time::Instant::now();
         info!(
             "loading training data for quantizer. sample size: {}",
@@ -449,6 +444,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
             "Finished loading training data in {:02} seconds",
             start.elapsed().as_secs_f32()
         );
+        self.progress.stage_complete("sample_quantizer").await?;
 
         // If metric type is cosine, normalize the training data, and after this point,
         // treat the metric type as L2.
@@ -475,6 +471,9 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
             _ => training_data.clone(),
         };
 
+        self.progress
+            .stage_start("train_quantizer", None, "")
+            .await?;
         info!("Start to train quantizer");
         let start = std::time::Instant::now();
         let quantizer = match &self.quantizer {
@@ -490,6 +489,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
             "Trained quantizer in {:02} seconds",
             start.elapsed().as_secs_f32()
         );
+        self.progress.stage_complete("train_quantizer").await?;
         Ok(quantizer)
     }
 

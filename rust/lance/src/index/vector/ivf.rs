@@ -1249,6 +1249,9 @@ pub async fn build_ivf_model(
     }
     let sample_size_hint = num_partitions * params.sample_rate;
 
+    progress
+        .stage_start("sample_ivf", Some(sample_size_hint as u64), "rows")
+        .await?;
     let start = std::time::Instant::now();
     info!(
         "Loading training data for IVF. Sample size: {}",
@@ -1259,6 +1262,8 @@ pub async fn build_ivf_model(
         "Finished loading training data in {:02} seconds",
         start.elapsed().as_secs_f32()
     );
+    progress.stage_complete("sample_ivf").await?;
+
     if params.sample_rate >= 1024 && training_data.value_type() == DataType::Float16 {
         warn!("Large sample_rate ({} >= 1024) for float16 vectors is possible to result in all zeros cluster centroid", params.sample_rate);
     }
@@ -1276,13 +1281,18 @@ pub async fn build_ivf_model(
     let training_data = arrow::compute::filter(&training_data, &is_finite(&training_data))?;
     let training_data = training_data.as_fixed_size_list();
 
+    let max_iters = Some(params.max_iters as u64);
+    progress
+        .stage_start("train_ivf", max_iters, "iterations")
+        .await?;
     info!("Start to train IVF model");
     let start = std::time::Instant::now();
-    let ivf = train_ivf_model(centroids, training_data, mt, params, progress).await?;
+    let ivf = train_ivf_model(centroids, training_data, mt, params, progress.clone()).await?;
     info!(
         "Trained IVF model in {:02} seconds",
         start.elapsed().as_secs_f32()
     );
+    progress.stage_complete("train_ivf").await?;
     Ok(ivf)
 }
 

@@ -10,7 +10,8 @@ use std::sync::Arc;
 /// Called at stage boundaries during index construction. Stages are sequential:
 /// `stage_complete` is always called before the next `stage_start`, so only one
 /// stage is active at a time. Stage names are index-type-specific (e.g.
-/// "train_ivf", "shuffle", "build_partitions" for vector indices; "load_data",
+/// "sample_ivf", "train_ivf", "sample_quantizer", "train_quantizer", "shuffle",
+/// "build_partitions" for vector indices; "load_data",
 /// "build_pages" for scalar indices).
 ///
 /// Methods take `&self` to allow concurrent calls from within a single stage.
