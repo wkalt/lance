@@ -581,6 +581,16 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
                     builder.with_fragments(filtered_fragments);
                 }
 
+                // Use smaller batch size during shuffle to reduce per-batch memory.
+                // Default 4096 instead of the dataset default (8192) — halves peak
+                // memory during shuffle with no throughput regression.
+                // Override via LANCE_SHUFFLE_BATCH_SIZE env var.
+                let shuffle_batch_size = std::env::var("LANCE_SHUFFLE_BATCH_SIZE")
+                    .ok()
+                    .and_then(|v| v.parse::<usize>().ok())
+                    .unwrap_or(4096);
+                builder.batch_size(shuffle_batch_size);
+
                 let (vector_type, _) = get_vector_type(dataset.schema(), &self.column)?;
                 let is_multivector = matches!(vector_type, datatypes::DataType::List(_));
                 if is_multivector {
