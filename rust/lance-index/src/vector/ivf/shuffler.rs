@@ -316,7 +316,7 @@ pub async fn shuffle_dataset(
                             batch = batch.take(&indices)?;
                         }
                     }
-                    ivf.transform(&batch)
+                    ivf.transform(batch)
                 })
             })
             .buffer_unordered(get_num_compute_intensive_cpus())

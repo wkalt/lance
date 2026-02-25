@@ -17,16 +17,16 @@ use num_traits::Float;
 use snafu::location;
 
 use lance_core::{Error, Result, ROW_ID, ROW_ID_FIELD};
-use lance_linalg::kernels::normalize_fsl;
+use lance_linalg::kernels::{normalize_fsl, normalize_fsl_owned};
 use tracing::instrument;
 
 /// Transform of a Vector Matrix.
 ///
 ///
 pub trait Transformer: Debug + Send + Sync {
-    /// Transform a [`RecordBatch`] of vectors
+    /// Transform a [`RecordBatch`] of vectors, consuming the input batch.
     ///
-    fn transform(&self, batch: &RecordBatch) -> Result<RecordBatch>;
+    fn transform(&self, batch: RecordBatch) -> Result<RecordBatch>;
 }
 
 /// Normalize Transformer
@@ -58,27 +58,45 @@ impl NormalizeTransformer {
 
 impl Transformer for NormalizeTransformer {
     #[instrument(name = "NormalizeTransformer::transform", level = "debug", skip_all)]
-    fn transform(&self, batch: &RecordBatch) -> Result<RecordBatch> {
-        let arr = batch
-            .column_by_name(&self.input_column)
-            .ok_or_else(|| Error::Index {
-                message: format!(
-                    "Normalize Transform: column {} not found in RecordBatch {}",
-                    self.input_column,
-                    batch.schema(),
-                ),
-                location: location!(),
-            })?;
-
-        let data = arr.as_fixed_size_list();
-        let norm = normalize_fsl(data)?;
-        let transformed = Arc::new(norm);
-
-        if let Some(output_column) = &self.output_column {
+    fn transform(&self, batch: RecordBatch) -> Result<RecordBatch> {
+        if self.output_column.is_some() {
+            // Output to a different column — need to keep the original, so copy
+            let arr = batch
+                .column_by_name(&self.input_column)
+                .ok_or_else(|| Error::Index {
+                    message: format!(
+                        "Normalize Transform: column {} not found in RecordBatch {}",
+                        self.input_column,
+                        batch.schema(),
+                    ),
+                    location: location!(),
+                })?;
+            let data = arr.as_fixed_size_list();
+            let norm = normalize_fsl(data)?;
+            let transformed = Arc::new(norm);
+            let output_column = self.output_column.as_ref().unwrap();
             let field = Field::new(output_column, transformed.data_type().clone(), true);
             Ok(batch.try_with_column(field, transformed)?)
         } else {
-            Ok(batch.replace_column_by_name(&self.input_column, transformed)?)
+            // In-place path: remove the column from the batch, normalize the owned
+            // FSL (in-place if solely owned), and put it back.
+            let col_idx = batch.schema().index_of(&self.input_column).map_err(|_| {
+                Error::Index {
+                    message: format!(
+                        "Normalize Transform: column {} not found in RecordBatch {}",
+                        self.input_column,
+                        batch.schema(),
+                    ),
+                    location: location!(),
+                }
+            })?;
+            let mut batch = batch;
+            let arr = batch.remove_column(col_idx);
+            let fsl = arr.as_fixed_size_list().clone();
+            drop(arr);
+            let norm = normalize_fsl_owned(fsl)?;
+            let field = Field::new(&self.input_column, norm.data_type().clone(), true);
+            Ok(batch.try_with_column(field, Arc::new(norm))?)
         }
     }
 }
@@ -111,9 +129,9 @@ where
 
 impl Transformer for KeepFiniteVectors {
     #[instrument(name = "KeepFiniteVectors::transform", level = "debug", skip_all)]
-    fn transform(&self, batch: &RecordBatch) -> Result<RecordBatch> {
+    fn transform(&self, batch: RecordBatch) -> Result<RecordBatch> {
         let Some(arr) = batch.column_by_name(&self.column) else {
-            return Ok(batch.clone());
+            return Ok(batch);
         };
 
         let data = match arr.data_type() {
@@ -131,15 +149,27 @@ impl Transformer for KeepFiniteVectors {
             }
         };
 
+        // Fast path: check the entire values buffer at once.
+        let values = data.values();
+        let all_finite = data.null_count() == 0
+            && match values.data_type() {
+                DataType::Float16 => is_all_finite::<Float16Type>(values.as_ref()),
+                DataType::Float32 => is_all_finite::<Float32Type>(values.as_ref()),
+                DataType::Float64 => is_all_finite::<Float64Type>(values.as_ref()),
+                DataType::UInt8 | DataType::Int8 => values.null_count() == 0,
+                _ => false,
+            };
+        if all_finite {
+            return Ok(batch);
+        }
+
+        // Slow path: per-vector filtering
         let mut valid = Vec::with_capacity(batch.num_rows());
         data.iter().enumerate().for_each(|(idx, arr)| {
             if let Some(data) = arr {
                 let is_valid = match data.data_type() {
-                    // f16 vectors are computed in f32 space, so they will not overflow.
                     DataType::Float16 => is_all_finite::<Float16Type>(&data),
-                    // f32 vectors must be bounded to avoid overflow in distance computation.
                     DataType::Float32 => is_all_finite::<Float32Type>(&data),
-                    // f32 vectors are computed in f32 space, so they have the same limit as f64.
                     DataType::Float64 => is_all_finite::<Float64Type>(&data),
                     DataType::UInt8 => data.null_count() == 0,
                     DataType::Int8 => data.null_count() == 0,
@@ -154,7 +184,7 @@ impl Transformer for KeepFiniteVectors {
             let indices = UInt32Array::from(valid);
             Ok(batch.take(&indices)?)
         } else {
-            Ok(batch.clone())
+            Ok(batch)
         }
     }
 }
@@ -173,7 +203,7 @@ impl DropColumn {
 }
 
 impl Transformer for DropColumn {
-    fn transform(&self, batch: &RecordBatch) -> Result<RecordBatch> {
+    fn transform(&self, batch: RecordBatch) -> Result<RecordBatch> {
         Ok(batch.drop_column(&self.column)?)
     }
 }
@@ -192,14 +222,14 @@ impl Flatten {
 }
 
 impl Transformer for Flatten {
-    fn transform(&self, batch: &RecordBatch) -> Result<RecordBatch> {
+    fn transform(&self, batch: RecordBatch) -> Result<RecordBatch> {
         let Some(arr) = batch.column_by_name(&self.column) else {
             // this case is that we have precomputed buffers,
             // so we don't need to flatten the original vectors.
-            return Ok(batch.clone());
+            return Ok(batch);
         };
         match arr.data_type() {
-            DataType::FixedSizeList(_, _) => Ok(batch.clone()),
+            DataType::FixedSizeList(_, _) => Ok(batch),
             DataType::List(_) => {
                 let row_ids = batch[ROW_ID].as_primitive::<UInt64Type>();
                 let vectors = arr.as_list::<i32>();
@@ -256,7 +286,7 @@ mod tests {
         )]);
         let batch = RecordBatch::try_new(schema.into(), vec![Arc::new(fsl)]).unwrap();
         let transformer = NormalizeTransformer::new("v");
-        let output = transformer.transform(&batch).unwrap();
+        let output = transformer.transform(batch).unwrap();
         let actual = output.column_by_name("v").unwrap();
         let act_fsl = actual.as_fixed_size_list();
         assert_eq!(act_fsl.len(), 2);
@@ -282,7 +312,7 @@ mod tests {
         )]);
         let batch = RecordBatch::try_new(schema.into(), vec![Arc::new(fsl)]).unwrap();
         let transformer = NormalizeTransformer::new("v");
-        let output = transformer.transform(&batch).unwrap();
+        let output = transformer.transform(batch).unwrap();
         let actual = output.column_by_name("v").unwrap();
         let act_fsl = actual.as_fixed_size_list();
         assert_eq!(act_fsl.len(), 2);
@@ -316,7 +346,7 @@ mod tests {
         )]);
         let batch = RecordBatch::try_new(schema.into(), vec![Arc::new(fsl.clone())]).unwrap();
         let transformer = NormalizeTransformer::new_with_output("v", "o");
-        let output = transformer.transform(&batch).unwrap();
+        let output = transformer.transform(batch).unwrap();
         let input = output.column_by_name("v").unwrap();
         assert_eq!(input.as_ref(), &fsl);
         let actual = output.column_by_name("o").unwrap();
@@ -348,10 +378,10 @@ mod tests {
         let batch =
             RecordBatch::try_new(schema.into(), vec![Arc::new(i32_array), Arc::new(fsl)]).unwrap();
         let transformer = DropColumn::new("v");
-        let output = transformer.transform(&batch).unwrap();
+        let output = transformer.transform(batch).unwrap();
         assert!(output.column_by_name("v").is_none());
 
-        let dup_drop_result = transformer.transform(&output);
+        let dup_drop_result = transformer.transform(output);
         assert!(dup_drop_result.is_ok());
     }
 

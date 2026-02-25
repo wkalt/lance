@@ -691,7 +691,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
                             // this batch is already transformed (in case of GPU training)
                             Ok(batch)
                         }
-                        None => ivf_transformer.transform(&batch),
+                        None => ivf_transformer.transform(batch),
                     }
                 })
             })
@@ -1317,7 +1317,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
         }
         let batch = arrow::compute::concat_batches(&batches[0].schema(), batches.iter())?;
         // for multivector, we need to flatten the vectors
-        let batch = Flatten::new(&self.column).transform(&batch)?;
+        let batch = Flatten::new(&self.column).transform(batch)?;
         // need to retrieve the row ids from the batch because some rows may have been deleted
         let row_ids = batch[ROW_ID].as_primitive::<UInt64Type>().clone();
         let vectors = batch
@@ -1808,7 +1808,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
             Arc::new(schema),
             vec![Arc::new(row_ids), Arc::new(vector), Arc::new(part_ids)],
         )?;
-        let batch = transformer.transform(&batch)?;
+        let batch = transformer.transform(batch)?;
 
         // slice the batch according to the ops count
         let mut results = Vec::with_capacity(assign_ops.len());

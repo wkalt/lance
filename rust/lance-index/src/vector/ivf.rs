@@ -356,10 +356,10 @@ impl IvfTransformer {
 
 impl Transformer for IvfTransformer {
     #[instrument(name = "IvfTransformer::transform", level = "debug", skip_all)]
-    fn transform(&self, batch: &RecordBatch) -> Result<RecordBatch> {
-        let mut batch = batch.clone();
+    fn transform(&self, batch: RecordBatch) -> Result<RecordBatch> {
+        let mut batch = batch;
         for transform in self.transforms.as_slice() {
-            batch = transform.transform(&batch)?;
+            batch = transform.transform(batch)?;
         }
         Ok(batch)
     }

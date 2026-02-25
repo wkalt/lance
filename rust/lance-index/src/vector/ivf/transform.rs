@@ -74,12 +74,12 @@ impl PartitionTransformer {
 }
 impl Transformer for PartitionTransformer {
     #[instrument(name = "PartitionTransformer::transform", level = "debug", skip_all)]
-    fn transform(&self, batch: &RecordBatch) -> Result<RecordBatch> {
+    fn transform(&self, batch: RecordBatch) -> Result<RecordBatch> {
         if !(batch.column_by_name(&self.output_column).is_none()
             || self.with_distance && batch.column_by_name(CENTROID_DIST_COLUMN).is_none())
         {
             // If the output columns are already present, we don't need to compute it again.
-            return Ok(batch.clone());
+            return Ok(batch);
         }
 
         // clear the columns if any of them is present
@@ -171,7 +171,7 @@ impl PartitionFilter {
 
 impl Transformer for PartitionFilter {
     #[instrument(name = "PartitionFilter::transform", level = "debug", skip_all)]
-    fn transform(&self, batch: &RecordBatch) -> Result<RecordBatch> {
+    fn transform(&self, batch: RecordBatch) -> Result<RecordBatch> {
         // TODO: use datafusion execute?
         let arr = batch
             .column_by_name(&self.column)

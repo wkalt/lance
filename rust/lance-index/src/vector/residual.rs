@@ -158,10 +158,10 @@ impl Transformer for ResidualTransform {
     ///
     /// The new [`RecordBatch`] will have a new column named `RESIDUAL_COLUMN`.
     #[instrument(name = "ResidualTransform::transform", level = "debug", skip_all)]
-    fn transform(&self, batch: &RecordBatch) -> Result<RecordBatch> {
+    fn transform(&self, batch: RecordBatch) -> Result<RecordBatch> {
         if batch.column_by_name(PQ_CODE_COLUMN).is_some() {
             // If the PQ code column is present, we don't need to compute residual vectors.
-            return Ok(batch.clone());
+            return Ok(batch);
         }
 
         let part_ids = batch.column_by_name(&self.part_col).ok_or(Error::Index {

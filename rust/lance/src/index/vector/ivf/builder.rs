@@ -224,7 +224,7 @@ pub async fn write_vector_storage(
     let mut transformed_stream = data
         .map_ok(move |batch| {
             let ivf_transformer = ivf_transformer.clone();
-            spawn_cpu(move || ivf_transformer.transform(&batch))
+            spawn_cpu(move || ivf_transformer.transform(batch))
         })
         .try_buffer_unordered(get_num_compute_intensive_cpus());
     let mut total_rows_written = 0;

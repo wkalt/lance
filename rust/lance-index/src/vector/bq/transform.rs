@@ -67,9 +67,9 @@ impl Debug for RQTransformer {
 
 impl Transformer for RQTransformer {
     #[instrument(name = "RQTransformer::transform", level = "debug", skip_all)]
-    fn transform(&self, batch: &RecordBatch) -> Result<RecordBatch> {
+    fn transform(&self, batch: RecordBatch) -> Result<RecordBatch> {
         if batch.column_by_name(RABIT_CODE_COLUMN).is_some() {
-            return Ok(batch.clone());
+            return Ok(batch);
         }
 
         let residual_vectors = batch

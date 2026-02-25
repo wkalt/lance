@@ -338,7 +338,7 @@ impl VectorStore for ScalarQuantizationStorage {
             SQ_CODE_COLUMN.to_string(),
         );
 
-        let new_batch = transformer.transform(&batch)?;
+        let new_batch = transformer.transform(batch)?;
 
         // self.quantizer.transform(data)
         let mut storage = self.clone();

@@ -50,7 +50,7 @@ impl Debug for SQTransformer {
 
 impl Transformer for SQTransformer {
     #[instrument(name = "SQTransformer::transform", level = "debug", skip_all)]
-    fn transform(&self, batch: &RecordBatch) -> Result<RecordBatch> {
+    fn transform(&self, batch: RecordBatch) -> Result<RecordBatch> {
         let input = batch
             .column_by_name(&self.input_column)
             .ok_or(Error::Index {
