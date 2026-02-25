@@ -15,6 +15,7 @@ use arrow_array::{
     Array, ArrayRef, ArrowNumericType, ArrowPrimitiveType, FixedSizeListArray, GenericStringArray,
     OffsetSizeTrait, PrimitiveArray, UInt64Array,
 };
+use arrow_buffer::ScalarBuffer;
 use arrow_schema::{ArrowError, DataType};
 use num_traits::AsPrimitive;
 use num_traits::{bounds::Bounded, Float, Num};
@@ -203,6 +204,67 @@ pub fn normalize_fsl(fsl: &FixedSizeListArray) -> Result<FixedSizeListArray> {
         DataType::Float16 => do_normalize_fsl::<Float16Type>(fsl),
         DataType::Float32 => do_normalize_fsl::<Float32Type>(fsl),
         DataType::Float64 => do_normalize_fsl::<Float64Type>(fsl),
+        _ => Err(ArrowError::SchemaError(format!(
+            "Normalize only supports float array, got: {}",
+            fsl.value_type()
+        ))),
+    }
+}
+
+fn do_normalize_fsl_inplace<T: ArrowPrimitiveType>(
+    fsl: FixedSizeListArray,
+) -> Result<FixedSizeListArray>
+where
+    T::Native: Float + Sum + AsPrimitive<f32>,
+{
+    let dim = fsl.value_length() as usize;
+    let (field, size, values_array, nulls) = fsl.into_parts();
+
+    // Extract the ScalarBuffer and DataType from the PrimitiveArray behind the Arc,
+    // then drop the Arc so the buffer's refcount decreases before we try into_mutable.
+    let (dt, scalar_buf) = {
+        let prim = values_array
+            .as_any()
+            .downcast_ref::<PrimitiveArray<T>>()
+            .expect("values must be PrimitiveArray");
+        (prim.data_type().clone(), prim.values().clone())
+    };
+    drop(values_array);
+
+    match scalar_buf.into_inner().into_mutable() {
+        Ok(mut mut_buf) => {
+            let data = mut_buf.typed_data_mut::<T::Native>();
+            for chunk in data.chunks_mut(dim) {
+                let l2_norm = chunk.iter().map(|x| x.powi(2)).sum::<T::Native>().sqrt();
+                for x in chunk.iter_mut() {
+                    *x = *x / l2_norm;
+                }
+            }
+            let scalar_buf: ScalarBuffer<T::Native> = mut_buf.into();
+            let prim = PrimitiveArray::<T>::new(scalar_buf, None).with_data_type(dt);
+            FixedSizeListArray::try_new(field, size, Arc::new(prim), nulls)
+        }
+        Err(buf) => {
+            // Buffer is shared; rebuild original FSL and fall back to copy path
+            let scalar_buf = ScalarBuffer::<T::Native>::from(buf);
+            let prim = PrimitiveArray::<T>::new(scalar_buf, None).with_data_type(dt);
+            let fsl =
+                FixedSizeListArray::try_new(field, size, Arc::new(prim), nulls)?;
+            do_normalize_fsl::<T>(&fsl)
+        }
+    }
+}
+
+/// L2 normalize a [FixedSizeListArray] (of vectors), attempting in-place mutation.
+///
+/// If the underlying buffer is uniquely owned, normalization is performed in-place
+/// to avoid allocating a second copy. Otherwise falls back to the copy path used
+/// by [`normalize_fsl`].
+pub fn normalize_fsl_owned(fsl: FixedSizeListArray) -> Result<FixedSizeListArray> {
+    match fsl.value_type() {
+        DataType::Float16 => do_normalize_fsl_inplace::<Float16Type>(fsl),
+        DataType::Float32 => do_normalize_fsl_inplace::<Float32Type>(fsl),
+        DataType::Float64 => do_normalize_fsl_inplace::<Float64Type>(fsl),
         _ => Err(ArrowError::SchemaError(format!(
             "Normalize only supports float array, got: {}",
             fsl.value_type()
@@ -450,5 +512,78 @@ mod tests {
         assert_relative_eq!(values.value(1), 0.0);
         assert_relative_eq!(values.value(2), 0.0);
         assert_relative_eq!(values.value(3), 1.0);
+    }
+
+    #[test]
+    fn test_normalize_fsl_owned_inplace() {
+        let values = Float32Array::from_iter_values(vec![
+            3.0, 4.0, // [3, 4] -> [0.6, 0.8]
+            5.0, 12.0, // [5, 12] -> [5/13, 12/13]
+        ]);
+        let field = Arc::new(Field::new("item", DataType::Float32, true));
+        let fsl = FixedSizeListArray::try_new(field, 2, Arc::new(values), None).unwrap();
+
+        // Get pointer to the underlying buffer before normalization
+        let buf_ptr = fsl.values().as_primitive::<Float32Type>().values().as_ptr();
+
+        // normalize_fsl_owned should mutate in-place when buffer is uniquely owned
+        let normalized = normalize_fsl_owned(fsl).unwrap();
+        let new_buf_ptr = normalized
+            .values()
+            .as_primitive::<Float32Type>()
+            .values()
+            .as_ptr();
+
+        // Buffer address should be the same (in-place mutation)
+        assert_eq!(buf_ptr, new_buf_ptr, "expected in-place mutation");
+
+        // Values should match normalize_fsl output
+        let normalized_values = normalized.values().as_primitive::<Float32Type>();
+        assert_relative_eq!(normalized_values.value(0), 0.6);
+        assert_relative_eq!(normalized_values.value(1), 0.8);
+        assert_relative_eq!(normalized_values.value(2), 5.0 / 13.0, epsilon = 1e-6);
+        assert_relative_eq!(normalized_values.value(3), 12.0 / 13.0, epsilon = 1e-6);
+    }
+
+    #[test]
+    fn test_normalize_fsl_owned_with_nulls() {
+        let values = Float32Array::from_iter_values(vec![
+            3.0, 4.0, // First vector: valid
+            0.0, 0.0, // Second vector: null
+            5.0, 12.0, // Third vector: valid
+        ]);
+        let null_buffer = NullBuffer::from(vec![true, false, true]);
+        let field = Arc::new(Field::new("item", DataType::Float32, true));
+        let fsl =
+            FixedSizeListArray::try_new(field, 2, Arc::new(values), Some(null_buffer.clone()))
+                .unwrap();
+
+        let normalized = normalize_fsl_owned(fsl).unwrap();
+        assert_eq!(normalized.nulls(), Some(&null_buffer));
+
+        let normalized_values = normalized.values().as_primitive::<Float32Type>();
+        assert_relative_eq!(normalized_values.value(0), 0.6);
+        assert_relative_eq!(normalized_values.value(1), 0.8);
+        assert_relative_eq!(normalized_values.value(4), 5.0 / 13.0, epsilon = 1e-6);
+        assert_relative_eq!(normalized_values.value(5), 12.0 / 13.0, epsilon = 1e-6);
+    }
+
+    #[test]
+    fn test_normalize_fsl_owned_shared_buffer_falls_back() {
+        let values = Float32Array::from_iter_values(vec![3.0, 4.0, 5.0, 12.0]);
+        let field = Arc::new(Field::new("item", DataType::Float32, true));
+        let fsl = FixedSizeListArray::try_new(field, 2, Arc::new(values), None).unwrap();
+
+        // Create a second reference to force shared buffer (fallback path)
+        let copy_fsl = fsl.clone();
+        let ref_result = normalize_fsl(&copy_fsl).unwrap();
+        let owned_result = normalize_fsl_owned(fsl).unwrap();
+
+        // Results should match even when falling back to copy path
+        let ref_vals = ref_result.values().as_primitive::<Float32Type>();
+        let owned_vals = owned_result.values().as_primitive::<Float32Type>();
+        for i in 0..4 {
+            assert_relative_eq!(ref_vals.value(i), owned_vals.value(i));
+        }
     }
 }

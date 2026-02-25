@@ -86,7 +86,7 @@ use lance_io::{
     traits::{Reader, WriteExt, Writer},
 };
 use lance_linalg::distance::{DistanceType, Dot, MetricType, L2};
-use lance_linalg::{distance::Normalize, kernels::normalize_fsl};
+use lance_linalg::{distance::Normalize, kernels::normalize_fsl_owned};
 use log::{info, warn};
 use object_store::path::Path;
 use prost::Message;
@@ -1271,19 +1271,24 @@ pub async fn build_ivf_model(
     // If metric type is cosine, normalize the training data, and after this point,
     // treat the metric type as L2.
     let (training_data, mt) = if metric_type == MetricType::Cosine {
-        let training_data = normalize_fsl(&training_data)?;
+        let training_data = normalize_fsl_owned(training_data)?;
         (training_data, MetricType::L2)
     } else {
         (training_data, metric_type)
     };
 
     // we filtered out nulls when sampling, but we still need to filter out NaNs and INFs here
-    let training_data = arrow::compute::filter(&training_data, &is_finite(&training_data))?;
-    let training_data = training_data.as_fixed_size_list();
+    let finite_mask = is_finite(&training_data);
+    let training_data = if finite_mask.true_count() == training_data.len() {
+        training_data
+    } else {
+        let filtered = arrow::compute::filter(&training_data, &finite_mask)?;
+        filtered.as_fixed_size_list().clone()
+    };
 
     info!("Start to train IVF model");
     let start = std::time::Instant::now();
-    let ivf = train_ivf_model(centroids, training_data, mt, params, progress).await?;
+    let ivf = train_ivf_model(centroids, &training_data, mt, params, progress).await?;
     info!(
         "Trained IVF model in {:02} seconds",
         start.elapsed().as_secs_f32()
