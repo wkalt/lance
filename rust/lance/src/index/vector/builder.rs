@@ -554,8 +554,14 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
             _ => {
                 log::info!("shuffle column {} over dataset", self.column);
                 let mut builder = dataset.scan();
+                // Cap scan readahead to limit memory from in-flight raw vector batches.
+                let shuffle_concurrency = std::env::var("LANCE_SHUFFLE_CONCURRENCY")
+                    .ok()
+                    .and_then(|v| v.parse::<usize>().ok())
+                    .unwrap_or_else(|| get_num_compute_intensive_cpus() / 2)
+                    .max(1);
                 builder
-                    .batch_readahead(get_num_compute_intensive_cpus())
+                    .batch_readahead(shuffle_concurrency)
                     .project(&[self.column.as_str()])?
                     .with_row_id();
 
@@ -695,7 +701,13 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
                     }
                 })
             })
-            .buffered(get_num_compute_intensive_cpus())
+            .buffered(
+                std::env::var("LANCE_SHUFFLE_CONCURRENCY")
+                    .ok()
+                    .and_then(|v| v.parse::<usize>().ok())
+                    .unwrap_or_else(|| get_num_compute_intensive_cpus() / 2)
+                    .max(1),
+            )
             .map(|x| x.unwrap())
             .peekable(),
         );
