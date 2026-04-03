@@ -57,7 +57,7 @@ impl FragmentSession {
         self.take_rows(&row_ids).await
     }
 
-    pub(crate) async fn take_rows(&self, row_offsets: &[u32]) -> Result<RecordBatch> {
+    pub async fn take_rows(&self, row_offsets: &[u32]) -> Result<RecordBatch> {
         if row_offsets.len() > 1 && FileFragment::row_ids_contiguous(row_offsets) {
             let range =
                 (row_offsets[0] as usize)..(row_offsets[row_offsets.len() - 1] as usize + 1);

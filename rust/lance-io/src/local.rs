@@ -117,6 +117,27 @@ impl LocalObjectReader {
         Self::open_with_tracker(path, block_size, known_size, Default::default()).await
     }
 
+    /// Perform a pread (read_exact_at) directly, without spawn_blocking.
+    fn do_pread(file: &File, range: &Range<usize>) -> object_store::Result<Bytes> {
+        let mut buf = BytesMut::with_capacity(range.len());
+        // Safety: `buf` is set with appropriate capacity above. It is
+        // written to below and we check all data is initialized at that point.
+        unsafe { buf.set_len(range.len()) };
+        #[cfg(unix)]
+        file.read_exact_at(buf.as_mut(), range.start as u64)
+            .map_err(|err| object_store::Error::Generic {
+                store: "LocalFileSystem",
+                source: err.into(),
+            })?;
+        #[cfg(windows)]
+        read_exact_at(file.clone(), buf.as_mut(), range.start as u64)
+            .map_err(|err| object_store::Error::Generic {
+                store: "LocalFileSystem",
+                source: err.into(),
+            })?;
+        Ok(buf.freeze())
+    }
+
     /// Open a local object reader with optional IO tracking.
     #[instrument(level = "debug")]
     pub(crate) async fn open_with_tracker(
@@ -179,39 +200,42 @@ impl Reader for LocalObjectReader {
     }
 
     /// Reads a range of data.
+    ///
+    /// Uses direct pread (no spawn_blocking) when LANCE_DIRECT_PREAD=1.
+    /// This avoids context-switch overhead when data is in the OS page cache,
+    /// significantly improving concurrent take throughput.
     #[instrument(level = "debug", skip(self))]
     fn get_range(&self, range: Range<usize>) -> BoxFuture<'static, object_store::Result<Bytes>> {
+        static USE_DIRECT_PREAD: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+            std::env::var("LANCE_DIRECT_PREAD")
+                .map(|v| v == "1" || v == "true")
+                .unwrap_or(false)
+        });
+
         let file = self.file.clone();
         let io_tracker = self.io_tracker.clone();
         let path = self.path.clone();
         let num_bytes = range.len() as u64;
         let range_u64 = (range.start as u64)..(range.end as u64);
 
-        Box::pin(async move {
-            let result = tokio::task::spawn_blocking(move || {
-                let mut buf = BytesMut::with_capacity(range.len());
-                // Safety: `buf` is set with appropriate capacity above. It is
-                // written to below and we check all data is initialized at that point.
-                unsafe { buf.set_len(range.len()) };
-                #[cfg(unix)]
-                file.read_exact_at(buf.as_mut(), range.start as u64)?;
-                #[cfg(windows)]
-                read_exact_at(file, buf.as_mut(), range.start as u64)?;
-
-                Ok(buf.freeze())
+        if *USE_DIRECT_PREAD {
+            Box::pin(async move {
+                let result = Self::do_pread(&file, &range);
+                if result.is_ok() {
+                    io_tracker.record_read("get_range", path, num_bytes, Some(range_u64));
+                }
+                result
             })
-            .await?
-            .map_err(|err: std::io::Error| object_store::Error::Generic {
-                store: "LocalFileSystem",
-                source: err.into(),
-            });
-
-            if result.is_ok() {
-                io_tracker.record_read("get_range", path, num_bytes, Some(range_u64));
-            }
-
-            result
-        })
+        } else {
+            Box::pin(async move {
+                let result = tokio::task::spawn_blocking(move || Self::do_pread(&file, &range))
+                    .await?;
+                if result.is_ok() {
+                    io_tracker.record_read("get_range", path, num_bytes, Some(range_u64));
+                }
+                result
+            })
+        }
     }
 
     /// Reads the entire file.
