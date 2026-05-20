@@ -84,6 +84,9 @@ lance-testing.workspace = true
 test-log.workspace = true
 rstest.workspace = true
 chrono.workspace = true
+url.workspace = true
+object_store = { workspace = true, features = ["azure"] }
+lance-io = { workspace = true, features = ["azure"] }
 
 [features]
 geo = ["dep:lance-geo", "lance-geo/geo", "dep:geoarrow-array", "dep:geoarrow-schema", "dep:geo-types"]

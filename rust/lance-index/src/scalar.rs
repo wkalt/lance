@@ -191,6 +191,10 @@ pub trait IndexWriter: Send {
 /// Trait for reading an index (or parts of an index) from storage
 #[async_trait]
 pub trait IndexReader: Send + Sync {
+    /// Downcast hook so callers needing reader-specific capabilities (e.g.
+    /// byte-range access for the FTS lazy-load path) can recover the
+    /// concrete type. Implementations should return `self`.
+    fn as_any(&self) -> &dyn Any;
     /// Read the n-th record batch from the file
     async fn read_record_batch(&self, n: u64, batch_size: u64) -> Result<RecordBatch>;
     /// Reads a global buffer by index.

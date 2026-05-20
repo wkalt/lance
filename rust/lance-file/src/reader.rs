@@ -488,6 +488,15 @@ impl FileReader {
             .await
     }
 
+    /// Submit a single byte-range request directly against the underlying
+    /// scheduler. This bypasses column/page logic and is intended for
+    /// readers that need sparse access into a column's raw data buffer
+    /// (e.g. the FTS lazy FST traversal, which walks a packed blob by byte
+    /// offset).
+    pub async fn read_file_byte_range(&self, range: std::ops::Range<u64>) -> Result<Bytes> {
+        self.scheduler.submit_single(range, 0).await
+    }
+
     async fn read_tail(scheduler: &FileScheduler) -> Result<(Bytes, u64)> {
         let file_size = scheduler.reader().size().await? as u64;
         let begin = if file_size < scheduler.reader().block_size() as u64 {

@@ -920,6 +920,9 @@ impl LazyRangedIndexReader {
 
 #[async_trait]
 impl IndexReader for LazyRangedIndexReader {
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
     async fn read_record_batch(&self, n: u64, batch_size: u64) -> Result<RecordBatch> {
         let (reader, local_page_idx) = self.get_reader_and_local_page_idx(n as u32).await?;
         reader
