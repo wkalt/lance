@@ -36,7 +36,7 @@ use crate::scalar::inverted::query::{FtsSearchParams, Tokens};
 /// object with positions. When fuzziness is enabled, each segment may
 /// contribute additional terms (via `expand_fuzzy_tokens`); the union of
 /// those terms is what the global scorer must cover.
-fn scorer_terms(
+async fn scorer_terms(
     indices: &[Arc<InvertedIndex>],
     query_tokens: &Tokens,
     params: &FtsSearchParams,
@@ -54,7 +54,7 @@ fn scorer_terms(
     }
 
     for index in indices {
-        let expanded = index.expand_fuzzy_tokens(query_tokens, params)?;
+        let expanded = index.expand_fuzzy_tokens(query_tokens, params).await?;
         for idx in 0..expanded.len() {
             let token = expanded.get_token(idx);
             if seen.insert(token.to_string()) {
@@ -84,7 +84,7 @@ pub async fn build_global_bm25_scorer(
     query_tokens: &Tokens,
     params: &FtsSearchParams,
 ) -> Result<MemBM25Scorer> {
-    let terms = scorer_terms(indices, query_tokens, params)?;
+    let terms = scorer_terms(indices, query_tokens, params).await?;
     let first_index = indices.first().ok_or_else(|| {
         lance_core::Error::invalid_input("FTS index requires at least one segment")
     })?;
