@@ -581,11 +581,18 @@ impl InvertedIndex {
     }
 
     /// Expand fuzzy query tokens against all partitions in this segment.
-    pub fn expand_fuzzy_tokens(&self, tokens: &Tokens, params: &FtsSearchParams) -> Result<Tokens> {
+    /// For v2 lazy partitions, force each partition's token-set FST into
+    /// memory before running the Levenshtein automaton against it.
+    pub async fn expand_fuzzy_tokens(
+        &self,
+        tokens: &Tokens,
+        params: &FtsSearchParams,
+    ) -> Result<Tokens> {
         let mut expanded_tokens = Vec::new();
         let mut expanded_positions = Vec::new();
         let mut seen = HashSet::new();
         for partition in &self.partitions {
+            partition.tokens.ensure_eager_loaded().await?;
             let expanded = partition.expand_fuzzy(tokens, params)?;
             for idx in 0..expanded.len() {
                 let token = expanded.get_token(idx);
@@ -1164,6 +1171,25 @@ impl InvertedPartition {
     }
 
     pub fn expand_fuzzy(&self, tokens: &Tokens, params: &FtsSearchParams) -> Result<Tokens> {
+        // Resolve the source FST. For Lazy variants, the caller must have
+        // already awaited `TokenSet::ensure_eager_loaded` (which fills the
+        // eager OnceCell); `load_posting_lists` does this when the query
+        // is fuzzy.
+        let fst_map: &fst::Map<Vec<u8>> = match &self.tokens.tokens {
+            TokenMap::Fst(map) => map,
+            TokenMap::Lazy(lm) => lm.eager.get().ok_or_else(|| {
+                Error::not_supported(
+                    "fuzzy expansion against a lazy token set requires \
+                     TokenSet::ensure_eager_loaded().await first"
+                        .to_owned(),
+                )
+            })?,
+            _ => {
+                return Err(Error::index(
+                    "tokens is not fst, which is not expected".to_owned(),
+                ));
+            }
+        };
         let mut new_tokens = Vec::with_capacity(min(tokens.len(), params.max_expansions));
         for token in tokens {
             let fuzziness = match params.fuzziness {
@@ -1174,30 +1200,17 @@ impl InvertedPartition {
                 .map_err(|e| Error::index(format!("failed to construct the fuzzy query: {}", e)))?;
 
             let base_len = tokens.token_type().prefix_len(token) as u32;
-            if let TokenMap::Fst(ref map) = self.tokens.tokens {
-                match base_len + params.prefix_length {
-                    0 => take_fst_keys(map.search(lev), &mut new_tokens, params.max_expansions),
-                    prefix_length => {
-                        let prefix = &token[..min(prefix_length as usize, token.len())];
-                        let prefix = fst::automaton::Str::new(prefix).starts_with();
-                        take_fst_keys(
-                            map.search(lev.intersection(prefix)),
-                            &mut new_tokens,
-                            params.max_expansions,
-                        )
-                    }
+            match base_len + params.prefix_length {
+                0 => take_fst_keys(fst_map.search(lev), &mut new_tokens, params.max_expansions),
+                prefix_length => {
+                    let prefix = &token[..min(prefix_length as usize, token.len())];
+                    let prefix = fst::automaton::Str::new(prefix).starts_with();
+                    take_fst_keys(
+                        fst_map.search(lev.intersection(prefix)),
+                        &mut new_tokens,
+                        params.max_expansions,
+                    )
                 }
-            } else if matches!(self.tokens.tokens, TokenMap::Lazy(_)) {
-                return Err(Error::not_supported(
-                    "fuzzy expansion not yet supported against a lazy token set; \
-                     call TokenSet::ensure_eager_loaded().await first or open the \
-                     partition without lazy mode"
-                        .to_owned(),
-                ));
-            } else {
-                return Err(Error::index(
-                    "tokens is not fst, which is not expected".to_owned(),
-                ));
             }
         }
         Ok(Tokens::new(new_tokens, tokens.token_type().clone()))
@@ -1216,7 +1229,13 @@ impl InvertedPartition {
         let is_fuzzy = matches!(params.fuzziness, Some(n) if n != 0);
         let is_phrase_query = params.phrase_slop.is_some();
         let tokens = match is_fuzzy {
-            true => self.expand_fuzzy(tokens, params)?,
+            true => {
+                // expand_fuzzy needs a full FST to run the Levenshtein
+                // automaton against; trigger a one-time materialization
+                // for Lazy variants (no-op for Fst/HashMap).
+                self.tokens.ensure_eager_loaded().await?;
+                self.expand_fuzzy(tokens, params)?
+            }
             false => tokens.clone(),
         };
         let token_positions = (0..tokens.len())
@@ -1333,7 +1352,35 @@ pub enum TokenMap {
     /// Lazy variant: token lookups go through a byte-range-fetching FST
     /// instead of pre-loading the whole blob. Used for cold reads of v2
     /// modern partitions where the full FST is expensive.
-    Lazy(Arc<crate::scalar::inverted::lazy_fst::LazyFst>),
+    Lazy(Arc<LazyTokenMap>),
+}
+
+/// Holds the lazy view of a token-set FST plus an on-demand eager copy.
+/// Constructed when the partition is opened; `eager` is populated only if
+/// a caller asks for full-key iteration (e.g. fuzzy expansion). Uses
+/// interior mutability via `OnceCell` so the eager fallback can be filled
+/// through a shared `&` reference.
+pub struct LazyTokenMap {
+    pub(crate) lazy: Arc<crate::scalar::inverted::lazy_fst::LazyFst>,
+    pub(crate) eager: tokio::sync::OnceCell<fst::Map<Vec<u8>>>,
+}
+
+impl std::fmt::Debug for LazyTokenMap {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LazyTokenMap")
+            .field("blob_len", &self.lazy.blob_len())
+            .field("eager_loaded", &self.eager.initialized())
+            .finish()
+    }
+}
+
+impl LazyTokenMap {
+    pub(crate) fn new(lazy: Arc<crate::scalar::inverted::lazy_fst::LazyFst>) -> Self {
+        Self {
+            lazy,
+            eager: tokio::sync::OnceCell::new(),
+        }
+    }
 }
 
 impl Default for TokenMap {
@@ -1347,9 +1394,9 @@ impl DeepSizeOf for TokenMap {
         match self {
             Self::HashMap(map) => map.deep_size_of_children(ctx),
             Self::Fst(map) => map.as_fst().size(),
-            // Approximate: report only the sparse-buffer + control struct;
-            // we don't traverse Mutex contents here.
-            Self::Lazy(lazy) => lazy.blob_len(),
+            Self::Lazy(lm) => {
+                lm.lazy.blob_len() + lm.eager.get().map(|m| m.as_fst().size()).unwrap_or(0)
+            }
         }
     }
 }
@@ -1359,7 +1406,7 @@ impl TokenMap {
         match self {
             Self::HashMap(map) => map.len(),
             Self::Fst(map) => map.len(),
-            Self::Lazy(lazy) => lazy.len(),
+            Self::Lazy(lm) => lm.lazy.len(),
         }
     }
 
@@ -1576,7 +1623,7 @@ impl TokenSet {
         let lazy_fst =
             LazyFst::try_open_with_token_extras(byte_reader, next_id, total_length).await?;
         Ok(Some(Self {
-            tokens: TokenMap::Lazy(Arc::new(lazy_fst)),
+            tokens: TokenMap::Lazy(Arc::new(LazyTokenMap::new(Arc::new(lazy_fst)))),
             next_id,
             total_length: usize::try_from(total_length).map_err(|_| {
                 Error::index(format!(
@@ -1740,26 +1787,39 @@ impl TokenSet {
 
     /// Async equivalent of [`Self::get`] that works for every variant —
     /// the Lazy variant fetches just the FST state regions needed for the
-    /// lookup, instead of touching the full token-set blob.
+    /// lookup, instead of touching the full token-set blob. If a prior
+    /// `ensure_eager_loaded` has already materialized the FST, the
+    /// in-memory map is used directly.
     pub async fn get_async(&self, token: &str) -> Result<Option<u32>> {
         match self.tokens {
             TokenMap::HashMap(ref map) => Ok(map.get(token).copied()),
             TokenMap::Fst(ref map) => Ok(map.get(token).map(|id| id as u32)),
-            TokenMap::Lazy(ref lazy) => lazy.get(token.as_bytes()).await,
+            TokenMap::Lazy(ref lm) => {
+                if let Some(eager) = lm.eager.get() {
+                    return Ok(eager.get(token).map(|id| id as u32));
+                }
+                lm.lazy.get(token.as_bytes()).await
+            }
         }
     }
 
-    /// For Lazy variants, fully load the FST blob into memory and convert
-    /// to the eager [`TokenMap::Fst`] variant. Required before any code
-    /// path that iterates every key (fuzzy expansion, `into_mut`,
-    /// `remap`). No-op for other variants.
-    pub async fn ensure_eager_loaded(&mut self) -> Result<()> {
-        if let TokenMap::Lazy(lazy) = &self.tokens {
-            let bytes = lazy.materialize().await?;
-            let fst_map = fst::Map::new(bytes.to_vec())
-                .map_err(|e| Error::io(format!("materialize lazy fst: {}", e)))?;
-            self.tokens = TokenMap::Fst(fst_map);
-        }
+    /// For Lazy variants, materialize the full FST blob via byte-range
+    /// reads and stash it in the lazy variant's eager-cache OnceCell.
+    /// Required before any code path that iterates every key (fuzzy
+    /// expansion). No-op for other variants. Uses `&self` (interior
+    /// mutability via OnceCell), so callers don't need exclusive access
+    /// to the partition.
+    pub async fn ensure_eager_loaded(&self) -> Result<()> {
+        let TokenMap::Lazy(lm) = &self.tokens else {
+            return Ok(());
+        };
+        lm.eager
+            .get_or_try_init(|| async {
+                let bytes = lm.lazy.materialize().await?;
+                fst::Map::new(bytes.to_vec())
+                    .map_err(|e| Error::io(format!("materialize lazy fst: {}", e)))
+            })
+            .await?;
         Ok(())
     }
 
@@ -1813,7 +1873,9 @@ impl TokenSet {
                             + std::mem::size_of::<usize>())
             }
             TokenMap::Fst(map) => map.as_fst().size(),
-            TokenMap::Lazy(lazy) => lazy.blob_len(),
+            TokenMap::Lazy(lm) => {
+                lm.lazy.blob_len() + lm.eager.get().map(|m| m.as_fst().size()).unwrap_or(0)
+            }
         }
     }
 }
