@@ -547,7 +547,7 @@ impl InvertedIndex {
             .map(|part| {
                 let part = part.clone();
                 async move {
-                    match part.tokens.get(term) {
+                    match part.tokens.get_async(term).await? {
                         Some(token_id) => part.inverted_list.posting_len_for_token(token_id).await,
                         None => Ok(0),
                     }
@@ -1094,7 +1094,18 @@ impl InvertedPartition {
         token_set_format: TokenSetFormat,
     ) -> Result<Self> {
         let token_file = store.open_index_file(&token_file_path(id)).await?;
-        let tokens = TokenSet::load(token_file, token_set_format).await?;
+        // For modern v2 Fst-format partitions backed by a lance v2 file,
+        // skip the eager full-blob load and use byte-range-fetched
+        // traversal. Falls back to eager load on any other layout
+        // (Arrow-format, legacy file reader, test stores, etc.).
+        let tokens = if matches!(token_set_format, TokenSetFormat::Fst) {
+            match TokenSet::load_fst_lazy(token_file.clone()).await? {
+                Some(lazy) => lazy,
+                None => TokenSet::load(token_file, token_set_format).await?,
+            }
+        } else {
+            TokenSet::load(token_file, token_set_format).await?
+        };
         let invert_list_file = store.open_index_file(&posting_file_path(id)).await?;
         let inverted_list = PostingListReader::try_new(invert_list_file, index_cache).await?;
         let docs_file = store.open_index_file(&doc_file_path(id)).await?;
@@ -1110,8 +1121,11 @@ impl InvertedPartition {
         })
     }
 
-    fn map(&self, token: &str) -> Option<u32> {
-        self.tokens.get(token)
+    /// Look up a query token. Routes through `TokenSet::get_async` so the
+    /// lazy v2 variant fetches only the FST state regions needed; eager
+    /// variants short-circuit to an immediate hashmap or fst lookup.
+    async fn map_async(&self, token: &str) -> Result<Option<u32>> {
+        self.tokens.get_async(token).await
     }
 
     pub fn expand_fuzzy(&self, tokens: &Tokens, params: &FtsSearchParams) -> Result<Tokens> {
@@ -1138,6 +1152,13 @@ impl InvertedPartition {
                         )
                     }
                 }
+            } else if matches!(self.tokens.tokens, TokenMap::Lazy(_)) {
+                return Err(Error::not_supported(
+                    "fuzzy expansion not yet supported against a lazy token set; \
+                     call TokenSet::ensure_eager_loaded().await first or open the \
+                     partition without lazy mode"
+                        .to_owned(),
+                ));
             } else {
                 return Err(Error::index(
                     "tokens is not fst, which is not expected".to_owned(),
@@ -1168,7 +1189,7 @@ impl InvertedPartition {
             .collect::<Vec<_>>();
         let mut token_ids = Vec::with_capacity(tokens.len());
         for (index, token) in tokens.into_iter().enumerate() {
-            let token_id = self.map(&token);
+            let token_id = self.map_async(&token).await?;
             if let Some(token_id) = token_id {
                 token_ids.push((token_id, token, token_positions[index]));
             } else if is_phrase_query {
@@ -1262,6 +1283,10 @@ impl InvertedPartition {
 pub enum TokenMap {
     HashMap(HashMap<String, u32>),
     Fst(fst::Map<Vec<u8>>),
+    /// Lazy variant: token lookups go through a byte-range-fetching FST
+    /// instead of pre-loading the whole blob. Used for cold reads of v2
+    /// modern partitions where the full FST is expensive.
+    Lazy(Arc<crate::scalar::inverted::lazy_fst::LazyFst>),
 }
 
 impl Default for TokenMap {
@@ -1275,6 +1300,9 @@ impl DeepSizeOf for TokenMap {
         match self {
             Self::HashMap(map) => map.deep_size_of_children(ctx),
             Self::Fst(map) => map.as_fst().size(),
+            // Approximate: report only the sparse-buffer + control struct;
+            // we don't traverse Mutex contents here.
+            Self::Lazy(lazy) => lazy.blob_len(),
         }
     }
 }
@@ -1284,6 +1312,7 @@ impl TokenMap {
         match self {
             Self::HashMap(map) => map.len(),
             Self::Fst(map) => map.len(),
+            Self::Lazy(lazy) => lazy.len(),
         }
     }
 
@@ -1314,6 +1343,10 @@ impl TokenSet {
 
                 new_map
             }
+            TokenMap::Lazy(_) => panic!(
+                "TokenSet::into_mut on Lazy variant; caller must \
+                 ensure_eager_loaded().await first"
+            ),
         };
 
         Self {
@@ -1356,6 +1389,10 @@ impl TokenSet {
                     token_id_builder.append_value(token_id);
                 }
             }
+            TokenMap::Lazy(_) => panic!(
+                "into_arrow_batch on Lazy TokenMap; caller must \
+                 ensure_eager_loaded().await first"
+            ),
         }
 
         let token_col = token_builder.finish();
@@ -1380,6 +1417,10 @@ impl TokenSet {
         let fst_map = match std::mem::take(&mut self.tokens) {
             TokenMap::Fst(map) => map,
             TokenMap::HashMap(map) => Self::build_fst_from_map(map)?,
+            TokenMap::Lazy(_) => panic!(
+                "into_fst_batch on Lazy TokenMap; caller must \
+                 ensure_eager_loaded().await first"
+            ),
         };
         let bytes = fst_map.into_fst().into_inner();
 
@@ -1429,6 +1470,74 @@ impl TokenSet {
             TokenSetFormat::Arrow => Self::load_arrow(reader).await,
             TokenSetFormat::Fst => Self::load_fst(reader).await,
         }
+    }
+
+    /// Lazy counterpart to [`Self::load_fst`]: reads only the small extras
+    /// (`next_id`, `total_length`) and stashes a [`crate::scalar::inverted::lazy_fst::LazyFst`]
+    /// that fetches FST state regions on demand. Returns `None` if the
+    /// supplied reader isn't a lance v2 FileReader, or if the FST blob is
+    /// too small to be worth the lazy overhead. Caller should fall back
+    /// to the eager path in either case.
+    pub async fn load_fst_lazy(reader: Arc<dyn IndexReader>) -> Result<Option<Self>> {
+        use crate::scalar::inverted::lazy_fst::{
+            LanceFileLazyFstReader, LazyFst, LazyFstByteReader, locate_fst_blob_in_lance_file,
+        };
+        // Tiny FSTs (test fixtures, partitions with a handful of tokens)
+        // are smaller than the lazy path's startup overhead and may even
+        // be smaller than the lazy header+trailer minimum. Fall back to
+        // eager below this threshold.
+        const MIN_LAZY_BLOB_BYTES: u64 = 16 * 1024;
+        let Ok(blob_range) = locate_fst_blob_in_lance_file(&reader) else {
+            return Ok(None);
+        };
+        if blob_range.end - blob_range.start < MIN_LAZY_BLOB_BYTES {
+            return Ok(None);
+        }
+        let file_reader = match reader
+            .as_any()
+            .downcast_ref::<lance_file::reader::FileReader>()
+        {
+            Some(r) => Arc::new(r.clone()),
+            None => return Ok(None),
+        };
+        // We still need next_id / total_length from the surrounding
+        // columns. These are tiny (one u32 + one u64), so one batch read
+        // for just those columns is cheap.
+        let extras_batch = reader
+            .read_range(
+                0..reader.num_rows(),
+                Some(&[TOKEN_NEXT_ID_COL, TOKEN_TOTAL_LENGTH_COL]),
+            )
+            .await?;
+        let next_id = extras_batch[TOKEN_NEXT_ID_COL]
+            .as_primitive::<datatypes::UInt32Type>()
+            .values()
+            .first()
+            .copied()
+            .ok_or_else(|| Error::index("token next id column is empty".to_owned()))?;
+        let total_length = extras_batch[TOKEN_TOTAL_LENGTH_COL]
+            .as_primitive::<datatypes::UInt64Type>()
+            .values()
+            .first()
+            .copied()
+            .ok_or_else(|| Error::index("token total length column is empty".to_owned()))?;
+        let byte_reader: Arc<dyn LazyFstByteReader> = Arc::new(LanceFileLazyFstReader::new(
+            file_reader,
+            blob_range.start,
+            blob_range.end - blob_range.start,
+        ));
+        let lazy_fst =
+            LazyFst::try_open_with_token_extras(byte_reader, next_id, total_length).await?;
+        Ok(Some(Self {
+            tokens: TokenMap::Lazy(Arc::new(lazy_fst)),
+            next_id,
+            total_length: usize::try_from(total_length).map_err(|_| {
+                Error::index(format!(
+                    "token total length {} overflows usize",
+                    total_length
+                ))
+            })?,
+        }))
     }
 
     async fn load_arrow(reader: Arc<dyn IndexReader>) -> Result<Self> {
@@ -1564,6 +1673,10 @@ impl TokenSet {
                     total_length,
                 }
             }
+            TokenMap::Lazy(_) => panic!(
+                "into_mutable on Lazy TokenMap; caller must \
+                 ensure_eager_loaded().await first"
+            ),
         }
     }
 
@@ -1571,7 +1684,36 @@ impl TokenSet {
         match self.tokens {
             TokenMap::HashMap(ref map) => map.get(token).copied(),
             TokenMap::Fst(ref map) => map.get(token).map(|id| id as u32),
+            TokenMap::Lazy(_) => panic!(
+                "TokenSet::get called on Lazy variant; callers must use \
+                 get_async or ensure_eager_loaded first"
+            ),
         }
+    }
+
+    /// Async equivalent of [`Self::get`] that works for every variant —
+    /// the Lazy variant fetches just the FST state regions needed for the
+    /// lookup, instead of touching the full token-set blob.
+    pub async fn get_async(&self, token: &str) -> Result<Option<u32>> {
+        match self.tokens {
+            TokenMap::HashMap(ref map) => Ok(map.get(token).copied()),
+            TokenMap::Fst(ref map) => Ok(map.get(token).map(|id| id as u32)),
+            TokenMap::Lazy(ref lazy) => lazy.get(token.as_bytes()).await,
+        }
+    }
+
+    /// For Lazy variants, fully load the FST blob into memory and convert
+    /// to the eager [`TokenMap::Fst`] variant. Required before any code
+    /// path that iterates every key (fuzzy expansion, `into_mut`,
+    /// `remap`). No-op for other variants.
+    pub async fn ensure_eager_loaded(&mut self) -> Result<()> {
+        if let TokenMap::Lazy(lazy) = &self.tokens {
+            let bytes = lazy.materialize().await?;
+            let fst_map = fst::Map::new(bytes.to_vec())
+                .map_err(|e| Error::io(format!("materialize lazy fst: {}", e)))?;
+            self.tokens = TokenMap::Fst(fst_map);
+        }
+        Ok(())
     }
 
     // the `removed_token_ids` must be sorted
@@ -1591,6 +1733,10 @@ impl TokenSet {
 
                 new_map
             }
+            TokenMap::Lazy(_) => panic!(
+                "remap on Lazy TokenMap; caller must \
+                 ensure_eager_loaded().await first"
+            ),
         };
 
         map.retain(
@@ -1620,6 +1766,7 @@ impl TokenSet {
                             + std::mem::size_of::<usize>())
             }
             TokenMap::Fst(map) => map.as_fst().size(),
+            TokenMap::Lazy(lazy) => lazy.blob_len(),
         }
     }
 }
@@ -5379,6 +5526,9 @@ mod tests {
 
     #[async_trait]
     impl IndexReader for CountingPostingReader {
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
         async fn read_record_batch(&self, n: u64, batch_size: u64) -> Result<RecordBatch> {
             self.inner.read_record_batch(n, batch_size).await
         }

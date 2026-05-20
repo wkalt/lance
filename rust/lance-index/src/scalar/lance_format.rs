@@ -146,6 +146,9 @@ impl IndexWriter for current_writer::FileWriter {
 
 #[async_trait]
 impl IndexReader for PreviousFileReader {
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
     async fn read_record_batch(&self, offset: u64, _batch_size: u64) -> Result<RecordBatch> {
         self.read_batch(offset as i32, ReadBatchParams::RangeFull, self.schema())
             .await
@@ -178,6 +181,9 @@ impl IndexReader for PreviousFileReader {
 
 #[async_trait]
 impl IndexReader for current_reader::FileReader {
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
     async fn read_record_batch(&self, offset: u64, batch_size: u64) -> Result<RecordBatch> {
         let start = offset * batch_size;
         let end = start + batch_size;

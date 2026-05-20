@@ -837,6 +837,10 @@ impl InnerBuilder {
                     token_id_map[token_id as usize] = new_token_id;
                 }
             }
+            TokenMap::Lazy(_) => panic!(
+                "merge_into on Lazy TokenMap; caller must \
+                 ensure_eager_loaded().await first"
+            ),
         }
 
         let doc_id_offset = self.docs.len() as u32;
