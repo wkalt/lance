@@ -647,6 +647,12 @@ impl<'a, S: Scorer> Wand<'a, S> {
             _ => {}
         }
 
+        // Deferred-row_id path: when the DocSet was built without
+        // row_ids (caller knows the mask is trivial and skipped the
+        // load), we stash the doc_id in the candidate's row_id slot and
+        // expect the caller to resolve it post-wand.
+        let docs_has_row_ids = self.docs.has_row_ids();
+
         let mut candidates = BinaryHeap::with_capacity(std::cmp::min(limit, BLOCK_SIZE * 10));
         let mut num_comparisons = 0;
         while let Some((doc, mut score)) = self.next()? {
@@ -654,12 +660,19 @@ impl<'a, S: Scorer> Wand<'a, S> {
 
             let row_id = match &doc {
                 DocInfo::Raw(doc) => {
-                    // if the doc is not located, we need to find the row id
-                    self.docs.row_id(doc.doc_id)
+                    if docs_has_row_ids {
+                        // Resolve doc_id -> row_id inline so we can run
+                        // the mask check.
+                        self.docs.row_id(doc.doc_id)
+                    } else {
+                        // Stash doc_id; caller will resolve to row_id
+                        // for the surviving top-K.
+                        doc.doc_id as u64
+                    }
                 }
                 DocInfo::Located(doc) => doc.row_id,
             };
-            if !mask.selected(row_id) {
+            if docs_has_row_ids && !mask.selected(row_id) {
                 if self.operator == Operator::Or {
                     self.push_back_leads(doc.doc_id() + 1);
                 }
