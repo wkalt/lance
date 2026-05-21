@@ -661,9 +661,19 @@ impl InvertedIndex {
                         // row_id/num_tokens download for it.
                         return Result::Ok(PartitionCandidates::empty());
                     }
-                    // Wand needs the full DocSet sync. Materialize it now,
-                    // only for partitions that actually contribute hits.
-                    part.docs.ensure_loaded().await?;
+                    // When the mask is trivial (no prefilter), wand never
+                    // needs to consult row_ids — it can score using just
+                    // num_tokens. We materialize only that column here
+                    // and resolve doc_id -> row_id for the surviving
+                    // top-K after wand returns. For non-trivial masks,
+                    // wand needs row_ids inline for `mask.selected`, so
+                    // fall back to the full DocSet load.
+                    let defer_row_ids = mask.is_select_all();
+                    if defer_row_ids {
+                        part.docs.ensure_num_tokens_loaded().await?;
+                    } else {
+                        part.docs.ensure_loaded().await?;
+                    }
                     let max_position = postings
                         .iter()
                         .map(|posting| posting.term_index() as usize)
@@ -677,20 +687,40 @@ impl InvertedIndex {
                     let params = params.clone();
                     let mask = mask.clone();
                     let metrics = metrics.clone();
-                    spawn_cpu(move || {
-                        let candidates = part.bm25_search(
+                    let part_for_wand = part.clone();
+                    let mut partition_result = spawn_cpu(move || {
+                        let candidates = part_for_wand.bm25_search(
                             params.as_ref(),
                             operator,
                             mask,
                             postings,
                             metrics.as_ref(),
                         )?;
-                        Ok(PartitionCandidates {
+                        std::result::Result::<_, Error>::Ok(PartitionCandidates {
                             tokens_by_position,
                             candidates,
                         })
                     })
-                    .await
+                    .await?;
+                    if defer_row_ids && !partition_result.candidates.is_empty() {
+                        // Wand stashed doc_ids in the row_id slot; resolve
+                        // them to actual row_ids now (one batch column
+                        // read per partition, cached on LazyDocSet).
+                        let doc_ids: Vec<u32> = partition_result
+                            .candidates
+                            .iter()
+                            .map(|c| c.row_id as u32)
+                            .collect();
+                        let row_ids = part.docs.resolve_row_ids(&doc_ids).await?;
+                        for (c, r) in partition_result
+                            .candidates
+                            .iter_mut()
+                            .zip(row_ids.into_iter())
+                        {
+                            c.row_id = r;
+                        }
+                    }
+                    Result::Ok(partition_result)
                 }
             })
             .collect::<Vec<_>>();
@@ -4224,11 +4254,25 @@ pub struct DocSet {
 impl DocSet {
     #[inline]
     pub fn len(&self) -> usize {
-        self.row_ids.len()
+        // Use num_tokens instead of row_ids so the deferred-row_ids
+        // scoring path (which constructs a DocSet via
+        // [`Self::from_num_tokens_only`]) still reports the right doc
+        // count.
+        self.num_tokens.len()
     }
 
     pub fn is_empty(&self) -> bool {
         self.len() == 0
+    }
+
+    /// True iff the per-doc `row_id` array is populated. The
+    /// deferred-row_id scoring path constructs DocSets with the array
+    /// left empty so wand can skip the load; callers that need to do
+    /// row_id lookups in the inner loop must check this and fall back
+    /// to async resolution otherwise.
+    #[inline]
+    pub fn has_row_ids(&self) -> bool {
+        !self.row_ids.is_empty()
     }
 
     pub fn iter(&self) -> impl Iterator<Item = (&u64, &u32)> {
@@ -4321,6 +4365,22 @@ impl DocSet {
         let row_id_col = batch[ROW_ID].as_primitive::<datatypes::UInt64Type>();
         let num_tokens_col = batch[NUM_TOKEN_COL].as_primitive::<datatypes::UInt32Type>();
         Self::from_columns(row_id_col, num_tokens_col, is_legacy, frag_reuse_index)
+    }
+
+    /// Build a `DocSet` carrying only the per-doc `num_tokens` array;
+    /// `row_ids` and `inv` are left empty. Used by the deferred-row_id
+    /// scoring path: wand checks `has_row_ids()` to skip `row_id` /
+    /// `num_tokens_by_row_id` calls, and the per-partition caller
+    /// resolves doc_id → row_id for the surviving top-K post-wand.
+    pub fn from_num_tokens_only(num_tokens_col: &arrow_array::UInt32Array) -> Self {
+        let num_tokens = num_tokens_col.values().to_vec();
+        let total_tokens = num_tokens.iter().map(|&n| n as u64).sum();
+        Self {
+            row_ids: Vec::new(),
+            num_tokens,
+            inv: Vec::new(),
+            total_tokens,
+        }
     }
 
     /// Build a `DocSet` from already-loaded `row_id` and `num_tokens`

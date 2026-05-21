@@ -52,6 +52,10 @@ pub struct LazyDocSet {
     /// scoring path avoids re-reading the same column for hit partitions
     /// after the stats path already pulled it.
     num_tokens_col: OnceCell<Arc<UInt32Array>>,
+    /// `ROW_ID` arrow buffer cached the first time it's read. Lets the
+    /// deferred-row_id scoring path resolve top-K doc_ids -> row_ids
+    /// without going through the full [`DocSet`] construction.
+    row_ids_col: OnceCell<Arc<UInt64Array>>,
     /// Full DocSet, materialized lazily when scoring needs per-doc
     /// `row_id`/`num_tokens`.
     full: OnceCell<Arc<DocSet>>,
@@ -69,8 +73,7 @@ impl std::fmt::Debug for LazyDocSet {
 
 impl deepsize::DeepSizeOf for LazyDocSet {
     fn deep_size_of_children(&self, ctx: &mut deepsize::Context) -> usize {
-        // Approximate: only account for the fully-loaded DocSet and the
-        // cached num_tokens column when present.
+        // Approximate: full DocSet plus cached arrow buffers when present.
         self.full
             .get()
             .map(|d| d.deep_size_of_children(ctx))
@@ -79,6 +82,11 @@ impl deepsize::DeepSizeOf for LazyDocSet {
                 .num_tokens_col
                 .get()
                 .map(|arr| arr.len() * std::mem::size_of::<u32>())
+                .unwrap_or(0)
+            + self
+                .row_ids_col
+                .get()
+                .map(|arr| arr.len() * std::mem::size_of::<u64>())
                 .unwrap_or(0)
     }
 }
@@ -97,6 +105,7 @@ impl LazyDocSet {
             num_rows,
             total_tokens: OnceCell::new(),
             num_tokens_col: OnceCell::new(),
+            row_ids_col: OnceCell::new(),
             full: OnceCell::new(),
         }
     }
@@ -115,6 +124,7 @@ impl LazyDocSet {
             num_rows,
             total_tokens: OnceCell::new(),
             num_tokens_col: OnceCell::new(),
+            row_ids_col: OnceCell::new(),
             full: OnceCell::new(),
         };
         let _ = me.total_tokens.set(total_tokens);
@@ -181,13 +191,9 @@ impl LazyDocSet {
         }
         let docs = if self.num_tokens_col.get().is_some() {
             let num_tokens = self.read_num_tokens_column().await?;
-            let batch = self
-                .reader
-                .read_range(0..self.num_rows, Some(&[ROW_ID]))
-                .await?;
-            let row_ids = batch[ROW_ID].as_primitive::<UInt64Type>();
+            let row_ids = self.read_row_ids_column().await?;
             DocSet::from_columns(
-                row_ids,
+                row_ids.as_ref(),
                 num_tokens.as_ref(),
                 self.is_legacy,
                 self.frag_reuse_index.clone(),
@@ -205,6 +211,65 @@ impl LazyDocSet {
         let _ = self.full.set(docs.clone());
         let _ = self.total_tokens.set(docs.total_tokens_num());
         Ok(self.full.get().unwrap().clone())
+    }
+
+    /// Materialize a DocSet that only has `num_tokens` populated (no
+    /// `row_ids`). Used by the deferred-row_id scoring path when the
+    /// query has no prefilter mask, so wand can run without the row_id
+    /// column. The per-partition caller is responsible for resolving
+    /// surviving doc_ids → row_ids post-wand.
+    pub async fn ensure_num_tokens_loaded(&self) -> Result<Arc<DocSet>> {
+        if let Some(full) = self.full.get() {
+            return Ok(full.clone());
+        }
+        let num_tokens = self.read_num_tokens_column().await?;
+        let docs = Arc::new(DocSet::from_num_tokens_only(num_tokens.as_ref()));
+        let _ = self.full.set(docs.clone());
+        let _ = self.total_tokens.set(docs.total_tokens_num());
+        Ok(self.full.get().unwrap().clone())
+    }
+
+    /// Resolve a batch of `doc_id`s to their `row_id`s. Used by the
+    /// deferred-row_id scoring path to map post-wand top-K candidates to
+    /// row_ids without ever loading the full [`DocSet`] arrays into a
+    /// [`DocSet`] struct. The row_id column is read once per partition
+    /// and cached; subsequent calls are pure indexing.
+    pub async fn resolve_row_ids(&self, doc_ids: &[u32]) -> Result<Vec<u64>> {
+        if let Some(full) = self.full.get()
+            && full.has_row_ids()
+        {
+            return Ok(doc_ids.iter().map(|&d| full.row_id(d)).collect());
+        }
+        if let Some(arr) = self.row_ids_col.get() {
+            return Ok(doc_ids.iter().map(|&d| arr.value(d as usize)).collect());
+        }
+        // Targeted range read covering just the doc_ids we need. For the
+        // typical case of a small top-K per partition the doc_ids are
+        // scattered, so we fetch one row per doc_id rather than the full
+        // column (which would defeat the deferred-row_id optimization).
+        // Lance v2 will coalesce nearby reads at the page level.
+        let mut row_ids = Vec::with_capacity(doc_ids.len());
+        for &d in doc_ids {
+            let d = d as usize;
+            let batch = self.reader.read_range(d..d + 1, Some(&[ROW_ID])).await?;
+            let arr = batch[ROW_ID].as_primitive::<UInt64Type>();
+            row_ids.push(arr.value(0));
+        }
+        Ok(row_ids)
+    }
+
+    /// Internal helper: read (or return cached) `ROW_ID` column.
+    async fn read_row_ids_column(&self) -> Result<Arc<UInt64Array>> {
+        if let Some(arr) = self.row_ids_col.get() {
+            return Ok(arr.clone());
+        }
+        let batch = self
+            .reader
+            .read_range(0..self.num_rows, Some(&[ROW_ID]))
+            .await?;
+        let arr = Arc::new(batch[ROW_ID].as_primitive::<UInt64Type>().clone());
+        let _ = self.row_ids_col.set(arr.clone());
+        Ok(self.row_ids_col.get().unwrap().clone())
     }
 }
 
