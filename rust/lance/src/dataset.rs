@@ -3347,13 +3347,15 @@ impl Dataset {
         }
         file_writer.finish().await?;
 
-        let (major, minor) = match format_version {
+        let resolved = format_version.resolve();
+        let (major, minor) = match resolved {
             lance_encoding::version::LanceFileVersion::Legacy => (0, 1),
-            _ => (2, 0),
+            lance_encoding::version::LanceFileVersion::V2_0 => (2, 0),
+            _ => (2, 1),
         };
 
         let data_file = DataFile {
-            path: format!("data/{}", file_name),
+            path: file_name,
             fields: field_ids.into(),
             column_indices: column_indices.into(),
             file_major_version: major,
@@ -3369,15 +3371,43 @@ impl Dataset {
     ///
     /// Each group adds a new data file to its fragment. Use with
     /// `write_fragment_column` for distributed column writes.
-    /// Commit a set of `DataReplacementGroup`s as a new dataset version.
+    /// Commit per-fragment column writes as a new dataset version using Merge.
     ///
-    /// Each group adds a new data file to its fragment. Use with
-    /// `write_fragment_column` for distributed column writes.
-    pub async fn commit_data_replacements(
+    /// Takes the DataReplacementGroups (mapping fragment_id -> data file),
+    /// merges the new data files into the existing fragment metadata,
+    /// and extends the schema with the new column.
+    pub async fn commit_column_writes(
         &mut self,
         replacements: Vec<transaction::DataReplacementGroup>,
+        new_column_schema: &lance_core::datatypes::Schema,
     ) -> Result<()> {
-        let operation = transaction::Operation::DataReplacement { replacements };
+        use lance_table::format::Fragment;
+
+        // Build new schema = existing + new columns.
+        let mut schema = self.schema().clone();
+        for field in &new_column_schema.fields {
+            schema.mut_field_by_id(field.id);
+            schema.fields.push(field.clone());
+        }
+
+        // Build new fragment list with merged data files.
+        let replacement_map: std::collections::HashMap<u64, &lance_table::format::DataFile> =
+            replacements
+                .iter()
+                .map(|r| (r.0, &r.1))
+                .collect();
+
+        let mut fragments = Vec::new();
+        for frag in self.get_fragments() {
+            let frag_id = frag.id() as u64;
+            let mut new_frag: Fragment = frag.metadata().clone();
+            if let Some(data_file) = replacement_map.get(&frag_id) {
+                new_frag.files.push((*data_file).clone());
+            }
+            fragments.push(new_frag);
+        }
+
+        let operation = transaction::Operation::Merge { fragments, schema };
         let transaction =
             transaction::Transaction::new(self.manifest.version, operation, None);
         self.apply_commit(transaction, &Default::default(), &Default::default())
