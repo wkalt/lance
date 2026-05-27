@@ -1412,7 +1412,7 @@ impl Dataset {
         .await
     }
 
-    pub(crate) async fn apply_commit(
+        pub async fn apply_commit(
         &mut self,
         transaction: Transaction,
         write_config: &ManifestWriteConfig,
@@ -2991,6 +2991,90 @@ impl Dataset {
         batch_size: Option<u32>,
     ) -> Result<()> {
         schema_evolution::add_columns(self, transforms, read_columns, batch_size).await
+    }
+
+    /// Write new column data for a single fragment, returning a `DataReplacementGroup`
+    /// that can be committed with `commit_data_replacements`.
+    ///
+    /// This is the building block for distributed column writes: each worker
+    /// writes its assigned fragments independently, then one worker commits all
+    /// the replacements atomically.
+    ///
+    /// The `data` iterator must produce exactly the physical row count for the
+    /// fragment (including nulls for filtered-out rows).
+    pub async fn write_fragment_column(
+        &self,
+        fragment_id: u64,
+        data: impl Iterator<Item = Result<RecordBatch>> + Send,
+        schema: &lance_core::datatypes::Schema,
+    ) -> Result<transaction::DataReplacementGroup> {
+        use lance_file::writer::{FileWriter, FileWriterOptions};
+        use lance_table::format::DataFile;
+        use uuid::Uuid;
+
+        let file_name = format!("{}.lance", Uuid::new_v4());
+        let path = self.data_dir().join(file_name.as_str());
+
+        let lance_schema = schema.clone();
+        let field_ids: Vec<i32> = lance_schema.fields.iter().map(|f| f.id).collect();
+        let column_indices: Vec<i32> = (0..field_ids.len() as i32).collect();
+
+        let format_version = self
+            .manifest
+            .data_storage_format
+            .lance_file_version()?;
+
+        let writer = self.object_store.create(&path).await?;
+        let mut file_writer = FileWriter::try_new(
+            writer,
+            lance_schema,
+            FileWriterOptions {
+                format_version: Some(format_version),
+                ..Default::default()
+            },
+        )?;
+
+        for batch_result in data {
+            let batch = batch_result?;
+            file_writer.write_batch(&batch).await?;
+        }
+        file_writer.finish().await?;
+
+        let (major, minor) = match format_version {
+            lance_encoding::version::LanceFileVersion::Legacy => (0, 1),
+            _ => (2, 0),
+        };
+
+        let data_file = DataFile {
+            path: format!("data/{}", file_name),
+            fields: field_ids.into(),
+            column_indices: column_indices.into(),
+            file_major_version: major,
+            file_minor_version: minor,
+            file_size_bytes: Default::default(),
+            base_id: None,
+        };
+
+        Ok(transaction::DataReplacementGroup(fragment_id, data_file))
+    }
+
+    /// Commit a set of `DataReplacementGroup`s as a new dataset version.
+    ///
+    /// Each group adds a new data file to its fragment. Use with
+    /// `write_fragment_column` for distributed column writes.
+    /// Commit a set of `DataReplacementGroup`s as a new dataset version.
+    ///
+    /// Each group adds a new data file to its fragment. Use with
+    /// `write_fragment_column` for distributed column writes.
+    pub async fn commit_data_replacements(
+        &mut self,
+        replacements: Vec<transaction::DataReplacementGroup>,
+    ) -> Result<()> {
+        let operation = transaction::Operation::DataReplacement { replacements };
+        let transaction =
+            transaction::Transaction::new(self.manifest.version, operation, None);
+        self.apply_commit(transaction, &Default::default(), &Default::default())
+            .await
     }
 
     /// Modify columns in the dataset, changing their name, type, or nullability.
