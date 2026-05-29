@@ -1412,7 +1412,7 @@ impl Dataset {
         .await
     }
 
-        pub async fn apply_commit(
+    pub async fn apply_commit(
         &mut self,
         transaction: Transaction,
         write_config: &ManifestWriteConfig,
@@ -3019,10 +3019,7 @@ impl Dataset {
         let field_ids: Vec<i32> = lance_schema.fields.iter().map(|f| f.id).collect();
         let column_indices: Vec<i32> = (0..field_ids.len() as i32).collect();
 
-        let format_version = self
-            .manifest
-            .data_storage_format
-            .lance_file_version()?;
+        let format_version = self.manifest.data_storage_format.lance_file_version()?;
 
         let writer = self.object_store.create(&path).await?;
         let mut file_writer = FileWriter::try_new(
@@ -3085,10 +3082,7 @@ impl Dataset {
 
         // Build new fragment list with merged data files.
         let replacement_map: std::collections::HashMap<u64, &lance_table::format::DataFile> =
-            replacements
-                .iter()
-                .map(|r| (r.0, &r.1))
-                .collect();
+            replacements.iter().map(|r| (r.0, &r.1)).collect();
 
         let mut fragments = Vec::new();
         for frag in self.get_fragments() {
@@ -3101,8 +3095,7 @@ impl Dataset {
         }
 
         let operation = transaction::Operation::Merge { fragments, schema };
-        let transaction =
-            transaction::Transaction::new(self.manifest.version, operation, None);
+        let transaction = transaction::Transaction::new(self.manifest.version, operation, None);
         self.apply_commit(transaction, &Default::default(), &Default::default())
             .await
     }
@@ -3501,7 +3494,7 @@ impl DatasetTakeRows for Dataset {
 }
 
 #[derive(Debug)]
-pub(crate) struct ManifestWriteConfig {
+pub struct ManifestWriteConfig {
     auto_set_feature_flags: bool,              // default true
     timestamp: Option<SystemTime>,             // default None
     use_stable_row_ids: bool,                  // default false
