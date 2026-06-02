@@ -197,6 +197,39 @@ impl ScalarIndexPlugin for InvertedIndexPlugin {
         "Inverted"
     }
 
+    // Cache the inverted index as a small, sized, serializable state
+    // rather than the default whole-object unsized entry, so it survives in the
+    // managed cache and queries don't re-open it from storage.
+    async fn get_from_cache(
+        &self,
+        index_store: Arc<dyn IndexStore>,
+        _frag_reuse_index: Option<Arc<crate::frag_reuse::FragReuseIndex>>,
+        cache: &LanceCache,
+    ) -> Result<Option<Arc<dyn crate::scalar::ScalarIndex>>> {
+        // The cached state already holds post-frag-reuse row_ids, and the cache
+        // is namespaced by the frag-reuse uuid, so reconstruct doesn't re-remap.
+        let Some(state) = cache.get_with_key(&index::InvertedIndexStateKey).await else {
+            return Ok(None);
+        };
+        let index = state.reconstruct(index_store, cache).await?;
+        Ok(Some(Arc::new(index) as Arc<dyn crate::scalar::ScalarIndex>))
+    }
+
+    async fn put_in_cache(
+        &self,
+        cache: &LanceCache,
+        index: Arc<dyn crate::scalar::ScalarIndex>,
+    ) -> Result<()> {
+        if let Some(inverted) = index.as_any().downcast_ref::<InvertedIndex>() {
+            if let Some(state) = inverted.to_cache_state() {
+                cache
+                    .insert_with_key(&index::InvertedIndexStateKey, Arc::new(state))
+                    .await;
+            }
+        }
+        Ok(())
+    }
+
     fn new_training_request(
         &self,
         params: &str,

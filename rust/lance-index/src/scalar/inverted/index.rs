@@ -40,7 +40,7 @@ use fst::{Automaton, IntoStreamer, Streamer};
 use futures::{FutureExt, Stream, StreamExt, TryStreamExt, stream};
 use itertools::Itertools;
 use lance_arrow::{RecordBatchExt, iter_str_array};
-use lance_core::cache::{CacheCodec, CacheKey, LanceCache, WeakLanceCache};
+use lance_core::cache::{CacheCodec, CacheCodecImpl, CacheKey, LanceCache, WeakLanceCache};
 use lance_core::error::{DataFusionResult, LanceOptionExt};
 use lance_core::utils::tokio::{get_num_compute_intensive_cpus, spawn_cpu};
 use lance_core::utils::tracing::{IO_TYPE_LOAD_SCALAR_PART, TRACE_IO_EVENTS};
@@ -4620,6 +4620,289 @@ pub fn is_phrase_query(query: &str) -> bool {
     query.starts_with('\"') && query.ends_with('\"')
 }
 
+// ---- Lance-native cache state for InvertedIndex ----
+//
+// The default plugin caches the whole decoded `InvertedIndex` as one unsized
+// (codec=None) entry. That object is large (per-partition token FSTs + doc
+// arrays) and gets evicted, so every query re-opens it from storage
+// (`indices_loaded=1`, the per-query open cost). Instead we cache a small,
+// serializable `InvertedIndexState` holding the already-built FST bytes and doc
+// arrays under a sized codec'd key. `reconstruct` zero-copy-wraps the FST,
+// rebuilds the DocSet from arrays, and re-opens only the cheap posting-list
+// reader — skipping the token/doc read+decode that dominates a cold open.
+
+impl TokenSet {
+    /// Raw FST bytes, if this token set is in the loaded/search (FST) form.
+    fn cached_fst_bytes(&self) -> Option<Vec<u8>> {
+        match &self.tokens {
+            TokenMap::Fst(map) => Some(map.as_fst().as_bytes().to_vec()),
+            TokenMap::HashMap(_) => None,
+        }
+    }
+
+    fn from_cached_fst(bytes: Vec<u8>, next_id: u32, total_length: usize) -> Result<Self> {
+        let map = fst::Map::new(bytes)
+            .map_err(|e| Error::io(format!("invalid cached token FST: {e}")))?;
+        Ok(Self {
+            tokens: TokenMap::Fst(map),
+            next_id,
+            total_length,
+        })
+    }
+}
+
+impl DocSet {
+    /// Rebuild from already-resolved (post-frag-reuse) row_ids + num_tokens,
+    /// reconstructing `inv` exactly as `DocSet::load` does for the given layout.
+    fn from_cached(row_ids: Vec<u64>, num_tokens: Vec<u32>, legacy: bool) -> Self {
+        let total_tokens = num_tokens.iter().map(|&x| x as u64).sum();
+        let inv = if legacy {
+            Vec::new()
+        } else {
+            let mut inv: Vec<(u64, u32)> = row_ids
+                .iter()
+                .enumerate()
+                .map(|(doc_id, &row_id)| (row_id, doc_id as u32))
+                .collect();
+            inv.sort_unstable_by_key(|entry| entry.0);
+            inv
+        };
+        Self {
+            row_ids,
+            num_tokens,
+            inv,
+            total_tokens,
+        }
+    }
+}
+
+struct PartitionCacheState {
+    id: u64,
+    legacy: bool,
+    next_id: u32,
+    total_length: usize,
+    fst_bytes: Vec<u8>,
+    row_ids: Vec<u64>,
+    num_tokens: Vec<u32>,
+}
+
+/// Lightweight, serializable snapshot of an [`InvertedIndex`] for caching.
+/// Carries the already-built per-partition token FST bytes and doc arrays;
+/// reconstruction re-opens only the posting reader.
+pub struct InvertedIndexState {
+    params: InvertedIndexParams,
+    token_set_format: TokenSetFormat,
+    deleted_fragments: RoaringBitmap,
+    partitions: Vec<PartitionCacheState>,
+}
+
+impl DeepSizeOf for InvertedIndexState {
+    fn deep_size_of_children(&self, _ctx: &mut deepsize::Context) -> usize {
+        self.partitions
+            .iter()
+            .map(|p| p.fst_bytes.len() + p.row_ids.len() * 8 + p.num_tokens.len() * 4)
+            .sum()
+    }
+}
+
+impl InvertedIndex {
+    /// Build a cache state, or `None` if any partition's token set isn't in FST
+    /// form (only the mutable build-time form is, never the loaded search form).
+    pub(crate) fn to_cache_state(&self) -> Option<InvertedIndexState> {
+        let mut partitions = Vec::with_capacity(self.partitions.len());
+        for part in &self.partitions {
+            let fst_bytes = part.tokens.cached_fst_bytes()?;
+            partitions.push(PartitionCacheState {
+                id: part.id,
+                legacy: part.is_legacy(),
+                next_id: part.tokens.next_id,
+                total_length: part.tokens.total_length,
+                fst_bytes,
+                row_ids: part.docs.row_ids.clone(),
+                num_tokens: part.docs.num_tokens.clone(),
+            });
+        }
+        Some(InvertedIndexState {
+            params: self.params.clone(),
+            token_set_format: self.token_set_format,
+            deleted_fragments: self.deleted_fragments.clone(),
+            partitions,
+        })
+    }
+}
+
+impl InvertedIndexState {
+    pub(crate) async fn reconstruct(
+        &self,
+        store: Arc<dyn IndexStore>,
+        index_cache: &LanceCache,
+    ) -> Result<InvertedIndex> {
+        let tokenizer = self.params.build()?;
+        let mut partitions = Vec::with_capacity(self.partitions.len());
+        for ps in &self.partitions {
+            let tokens =
+                TokenSet::from_cached_fst(ps.fst_bytes.clone(), ps.next_id, ps.total_length)?;
+            let docs = DocSet::from_cached(ps.row_ids.clone(), ps.num_tokens.clone(), ps.legacy);
+            let invert_file = store.open_index_file(&posting_file_path(ps.id)).await?;
+            let inverted_list = Arc::new(PostingListReader::try_new(invert_file, index_cache).await?);
+            partitions.push(Arc::new(InvertedPartition {
+                id: ps.id,
+                store: store.clone(),
+                tokens,
+                inverted_list,
+                docs,
+                token_set_format: self.token_set_format,
+            }));
+        }
+        Ok(InvertedIndex {
+            params: self.params.clone(),
+            store,
+            tokenizer,
+            token_set_format: self.token_set_format,
+            partitions,
+            deleted_fragments: self.deleted_fragments.clone(),
+        })
+    }
+}
+
+fn cache_read_u8(data: &[u8], off: &mut usize) -> Result<u8> {
+    let v = *data
+        .get(*off)
+        .ok_or_else(|| Error::io("InvertedIndexState: truncated".to_string()))?;
+    *off += 1;
+    Ok(v)
+}
+
+fn cache_read_u32(data: &[u8], off: &mut usize) -> Result<u32> {
+    let end = *off + 4;
+    let slice = data
+        .get(*off..end)
+        .ok_or_else(|| Error::io("InvertedIndexState: truncated".to_string()))?;
+    *off = end;
+    Ok(u32::from_le_bytes(slice.try_into().unwrap()))
+}
+
+fn cache_read_u64(data: &[u8], off: &mut usize) -> Result<u64> {
+    let end = *off + 8;
+    let slice = data
+        .get(*off..end)
+        .ok_or_else(|| Error::io("InvertedIndexState: truncated".to_string()))?;
+    *off = end;
+    Ok(u64::from_le_bytes(slice.try_into().unwrap()))
+}
+
+fn cache_read_bytes(data: &[u8], off: &mut usize) -> Result<Vec<u8>> {
+    let len = cache_read_u32(data, off)? as usize;
+    let end = *off + len;
+    let slice = data
+        .get(*off..end)
+        .ok_or_else(|| Error::io("InvertedIndexState: truncated".to_string()))?;
+    *off = end;
+    Ok(slice.to_vec())
+}
+
+impl CacheCodecImpl for InvertedIndexState {
+    fn serialize(&self, writer: &mut dyn std::io::Write) -> Result<()> {
+        let write_bytes = |w: &mut dyn std::io::Write, b: &[u8]| -> Result<()> {
+            w.write_all(&(b.len() as u32).to_le_bytes())?;
+            w.write_all(b)?;
+            Ok(())
+        };
+        let params_json = serde_json::to_vec(&self.params)
+            .map_err(|e| Error::io(format!("InvertedIndexState params: {e}")))?;
+        write_bytes(writer, &params_json)?;
+        let fmt: u8 = match self.token_set_format {
+            TokenSetFormat::Arrow => 0,
+            TokenSetFormat::Fst => 1,
+        };
+        writer.write_all(&[fmt])?;
+        let mut df = Vec::new();
+        self.deleted_fragments
+            .serialize_into(&mut df)
+            .map_err(|e| Error::io(format!("InvertedIndexState deleted_fragments: {e}")))?;
+        write_bytes(writer, &df)?;
+        writer.write_all(&(self.partitions.len() as u32).to_le_bytes())?;
+        for p in &self.partitions {
+            writer.write_all(&p.id.to_le_bytes())?;
+            writer.write_all(&[p.legacy as u8])?;
+            writer.write_all(&p.next_id.to_le_bytes())?;
+            writer.write_all(&(p.total_length as u64).to_le_bytes())?;
+            write_bytes(writer, &p.fst_bytes)?;
+            writer.write_all(&(p.row_ids.len() as u32).to_le_bytes())?;
+            for r in &p.row_ids {
+                writer.write_all(&r.to_le_bytes())?;
+            }
+            for n in &p.num_tokens {
+                writer.write_all(&n.to_le_bytes())?;
+            }
+        }
+        Ok(())
+    }
+
+    fn deserialize(data: &bytes::Bytes) -> Result<Self> {
+        let mut off = 0usize;
+        let params_json = cache_read_bytes(data, &mut off)?;
+        let params: InvertedIndexParams = serde_json::from_slice(&params_json)
+            .map_err(|e| Error::io(format!("InvertedIndexState params: {e}")))?;
+        let token_set_format = match cache_read_u8(data, &mut off)? {
+            0 => TokenSetFormat::Arrow,
+            1 => TokenSetFormat::Fst,
+            other => return Err(Error::io(format!("InvertedIndexState format tag {other}"))),
+        };
+        let df = cache_read_bytes(data, &mut off)?;
+        let deleted_fragments = RoaringBitmap::deserialize_from(&df[..])
+            .map_err(|e| Error::io(format!("InvertedIndexState deleted_fragments: {e}")))?;
+        let n_parts = cache_read_u32(data, &mut off)? as usize;
+        let mut partitions = Vec::with_capacity(n_parts);
+        for _ in 0..n_parts {
+            let id = cache_read_u64(data, &mut off)?;
+            let legacy = cache_read_u8(data, &mut off)? != 0;
+            let next_id = cache_read_u32(data, &mut off)?;
+            let total_length = cache_read_u64(data, &mut off)? as usize;
+            let fst_bytes = cache_read_bytes(data, &mut off)?;
+            let count = cache_read_u32(data, &mut off)? as usize;
+            let mut row_ids = Vec::with_capacity(count);
+            for _ in 0..count {
+                row_ids.push(cache_read_u64(data, &mut off)?);
+            }
+            let mut num_tokens = Vec::with_capacity(count);
+            for _ in 0..count {
+                num_tokens.push(cache_read_u32(data, &mut off)?);
+            }
+            partitions.push(PartitionCacheState {
+                id,
+                legacy,
+                next_id,
+                total_length,
+                fst_bytes,
+                row_ids,
+                num_tokens,
+            });
+        }
+        Ok(Self {
+            params,
+            token_set_format,
+            deleted_fragments,
+            partitions,
+        })
+    }
+}
+
+pub(crate) struct InvertedIndexStateKey;
+
+impl CacheKey for InvertedIndexStateKey {
+    type ValueType = InvertedIndexState;
+    fn key(&self) -> std::borrow::Cow<'_, str> {
+        "inverted_index_state".into()
+    }
+    fn type_name() -> &'static str {
+        "InvertedIndexState"
+    }
+    fn codec() -> Option<CacheCodec> {
+        Some(CacheCodec::from_impl::<InvertedIndexState>())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use crate::scalar::inverted::document_tokenizer::DocType;
@@ -4688,6 +4971,55 @@ mod tests {
         writer.finish_with_metadata(metadata).await?;
 
         InvertedIndex::load(store, None, &LanceCache::no_cache()).await
+    }
+
+    #[tokio::test]
+    async fn inverted_index_cache_state_roundtrip() {
+        let tmpdir = TempObjDir::default();
+        let store = Arc::new(LanceIndexStore::new(
+            ObjectStore::local().into(),
+            tmpdir.clone(),
+            Arc::new(LanceCache::no_cache()),
+        ));
+        let index = write_single_partition_index(
+            store.clone(),
+            InvertedIndexParams::default(),
+            TokenSetFormat::default(),
+            "lance",
+            42,
+        )
+        .await
+        .unwrap();
+
+        let baseline = index.do_search("lance").await.unwrap();
+
+        // Round-trip through the cache state: extract -> serialize -> deserialize
+        // -> reconstruct, exercising the full codec + reconstruct path.
+        let state = index
+            .to_cache_state()
+            .expect("a loaded (FST-form) index produces a cache state");
+        let mut buf = Vec::new();
+        state.serialize(&mut buf).unwrap();
+        let restored =
+            InvertedIndexState::deserialize(&bytes::Bytes::from(buf)).unwrap();
+        let index2 = restored
+            .reconstruct(store.clone(), &LanceCache::no_cache())
+            .await
+            .unwrap();
+
+        // Structurally equivalent...
+        assert_eq!(index2.partitions.len(), index.partitions.len());
+        assert_eq!(
+            index2.partitions[0].tokens.len(),
+            index.partitions[0].tokens.len()
+        );
+        assert_eq!(
+            index2.partitions[0].docs.len(),
+            index.partitions[0].docs.len()
+        );
+        // ...and returns identical search results.
+        let reconstructed = index2.do_search("lance").await.unwrap();
+        assert_eq!(baseline, reconstructed);
     }
 
     fn empty_doc_stream() -> SendableRecordBatchStream {
