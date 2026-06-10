@@ -1043,6 +1043,17 @@ const PREWARM_FALLBACK_TOTAL_MEMORY_BYTES: u64 = 4 << 30;
 /// while splitting multi-GiB ones into bounded pieces.
 const PREWARM_CHUNK_TARGET_BYTES: u64 = 32 << 20;
 
+/// Resolve the prewarm chunk target bytes, overridable via
+/// `LANCE_FTS_PREWARM_CHUNK_BYTES` to tune the prewarm time/peak-memory trade
+/// (larger chunks = fewer reads = faster, higher peak).
+fn prewarm_chunk_target_bytes() -> u64 {
+    std::env::var("LANCE_FTS_PREWARM_CHUNK_BYTES")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .filter(|&v| v > 0)
+        .unwrap_or(PREWARM_CHUNK_TARGET_BYTES)
+}
+
 /// Max token rows per chunk, regardless of byte size — bounds the built `Vec`
 /// when posting lists are tiny (many tokens, few bytes).
 const PREWARM_MAX_CHUNK_TOKENS: usize = 4096;
@@ -1059,7 +1070,7 @@ fn prewarm_chunk_tokens(token_count: usize, file_size_bytes: u64) -> usize {
     }
     // Average bytes per token row; >= 1 to avoid div-by-zero.
     let bytes_per_token = (file_size_bytes / token_count as u64).max(1);
-    let by_bytes = (PREWARM_CHUNK_TARGET_BYTES / bytes_per_token) as usize;
+    let by_bytes = (prewarm_chunk_target_bytes() / bytes_per_token) as usize;
     by_bytes.clamp(PREWARM_MIN_CHUNK_TOKENS, PREWARM_MAX_CHUNK_TOKENS)
 }
 
@@ -2840,8 +2851,8 @@ impl PostingListReader {
     /// briefly coexist), so the solo fallback fires only on a genuinely undersized
     /// budget, not merely a large file.
     pub(crate) fn prewarm_admission_cost_bytes(&self) -> u64 {
-        const CHUNK_WORKING_SET_BYTES: u64 = 2 * PREWARM_CHUNK_TARGET_BYTES;
-        self.posting_data_size_bytes().min(CHUNK_WORKING_SET_BYTES)
+        let chunk_working_set_bytes = 2 * prewarm_chunk_target_bytes();
+        self.posting_data_size_bytes().min(chunk_working_set_bytes)
     }
 
     pub(crate) async fn read_batch(&self, with_position: bool) -> Result<RecordBatch> {
