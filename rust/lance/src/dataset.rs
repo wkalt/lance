@@ -3377,6 +3377,7 @@ impl Dataset {
         &mut self,
         replacements: Vec<transaction::DataReplacementGroup>,
         new_column_schema: &lance_core::datatypes::Schema,
+        transaction_properties: Option<Arc<std::collections::HashMap<String, String>>>,
     ) -> Result<()> {
         use lance_table::format::Fragment;
 
@@ -3430,8 +3431,9 @@ impl Dataset {
             }
 
             let operation = transaction::Operation::Merge { fragments, schema };
-            let transaction =
+            let mut transaction =
                 transaction::Transaction::new(self.manifest.version, operation, None);
+            transaction.transaction_properties = transaction_properties.clone();
             match self
                 .apply_commit(transaction, &Default::default(), &Default::default())
                 .await
