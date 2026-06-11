@@ -3380,11 +3380,14 @@ impl Dataset {
     ) -> Result<()> {
         use lance_table::format::Fragment;
 
-        // Build new schema = existing + new columns.
+        // Build new schema = existing + new columns. Skip fields that are
+        // already present (incremental column writes: the column exists in
+        // the schema and only fragments missing its data file are written).
         let mut schema = self.schema().clone();
         for field in &new_column_schema.fields {
-            schema.mut_field_by_id(field.id);
-            schema.fields.push(field.clone());
+            if schema.field_by_id(field.id).is_none() {
+                schema.fields.push(field.clone());
+            }
         }
 
         // Build new fragment list with merged data files.
