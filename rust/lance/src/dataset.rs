@@ -3380,52 +3380,77 @@ impl Dataset {
     ) -> Result<()> {
         use lance_table::format::Fragment;
 
-        // Build new schema = existing + new columns. Skip fields that are
-        // already present (incremental column writes: the column exists in
-        // the schema and only fragments missing its data file are written).
-        let mut schema = self.schema().clone();
-        for field in &new_column_schema.fields {
-            if schema.field_by_id(field.id).is_none() {
-                schema.fields.push(field.clone());
-            }
-        }
-
-        // Build new fragment list with merged data files.
         let replacement_map: std::collections::HashMap<u64, &lance_table::format::DataFile> =
             replacements.iter().map(|r| (r.0, &r.1)).collect();
 
-        let mut fragments = Vec::new();
-        for frag in self.get_fragments() {
-            let frag_id = frag.id() as u64;
-            let mut new_frag: Fragment = frag.metadata().clone();
-            if let Some(data_file) = replacement_map.get(&frag_id) {
-                // Tombstone the replaced fields in existing files (same
-                // mechanism as the update-columns path) so the new file is
-                // authoritative for fragments that already covered the
-                // column (e.g. inserts that wrote nulls inline).
-                let replaced: std::collections::HashSet<i32> =
-                    data_file.fields.iter().copied().collect();
-                for file in &mut new_frag.files {
-                    let new_fields: std::sync::Arc<[i32]> = file
-                        .fields
-                        .iter()
-                        .map(|field| if replaced.contains(field) { -2 } else { *field })
-                        .collect::<Vec<_>>()
-                        .into();
-                    file.fields = new_fields;
+        // Merge-vs-Merge conflicts are not rebased automatically; the
+        // conflict resolver asks the caller to retry. Rebuild the fragment
+        // list and schema from the latest version each attempt so a
+        // concurrent column commit's data files are preserved.
+        const MAX_COMMIT_RETRIES: usize = 5;
+        let mut attempt = 0;
+        loop {
+            // Build new schema = existing + new columns. Skip fields that
+            // are already present (incremental column writes: the column
+            // exists in the schema and only fragments missing its data
+            // file are written).
+            let mut schema = self.schema().clone();
+            for field in &new_column_schema.fields {
+                if schema.field_by_id(field.id).is_none() {
+                    schema.fields.push(field.clone());
                 }
-                new_frag
-                    .files
-                    .retain(|file| file.fields.iter().any(|&field| field != -2));
-                new_frag.files.push((*data_file).clone());
             }
-            fragments.push(new_frag);
-        }
 
-        let operation = transaction::Operation::Merge { fragments, schema };
-        let transaction = transaction::Transaction::new(self.manifest.version, operation, None);
-        self.apply_commit(transaction, &Default::default(), &Default::default())
-            .await
+            let mut fragments = Vec::new();
+            for frag in self.get_fragments() {
+                let frag_id = frag.id() as u64;
+                let mut new_frag: Fragment = frag.metadata().clone();
+                if let Some(data_file) = replacement_map.get(&frag_id) {
+                    // Tombstone the replaced fields in existing files (same
+                    // mechanism as the update-columns path) so the new file
+                    // is authoritative for fragments that already covered
+                    // the column (e.g. inserts that wrote nulls inline).
+                    let replaced: std::collections::HashSet<i32> =
+                        data_file.fields.iter().copied().collect();
+                    for file in &mut new_frag.files {
+                        let new_fields: std::sync::Arc<[i32]> = file
+                            .fields
+                            .iter()
+                            .map(|field| if replaced.contains(field) { -2 } else { *field })
+                            .collect::<Vec<_>>()
+                            .into();
+                        file.fields = new_fields;
+                    }
+                    new_frag
+                        .files
+                        .retain(|file| file.fields.iter().any(|&field| field != -2));
+                    new_frag.files.push((*data_file).clone());
+                }
+                fragments.push(new_frag);
+            }
+
+            let operation = transaction::Operation::Merge { fragments, schema };
+            let transaction =
+                transaction::Transaction::new(self.manifest.version, operation, None);
+            match self
+                .apply_commit(transaction, &Default::default(), &Default::default())
+                .await
+            {
+                Ok(()) => return Ok(()),
+                Err(e)
+                    if attempt < MAX_COMMIT_RETRIES
+                        && e.to_string().contains("Retryable commit conflict") =>
+                {
+                    attempt += 1;
+                    log::info!(
+                        "commit_column_writes: retryable conflict (attempt {}), rebasing on latest",
+                        attempt
+                    );
+                    self.checkout_latest().await?;
+                }
+                Err(e) => return Err(e),
+            }
+        }
     }
 
     /// Modify columns in the dataset, changing their name, type, or nullability.
