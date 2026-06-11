@@ -3399,6 +3399,24 @@ impl Dataset {
             let frag_id = frag.id() as u64;
             let mut new_frag: Fragment = frag.metadata().clone();
             if let Some(data_file) = replacement_map.get(&frag_id) {
+                // Tombstone the replaced fields in existing files (same
+                // mechanism as the update-columns path) so the new file is
+                // authoritative for fragments that already covered the
+                // column (e.g. inserts that wrote nulls inline).
+                let replaced: std::collections::HashSet<i32> =
+                    data_file.fields.iter().copied().collect();
+                for file in &mut new_frag.files {
+                    let new_fields: std::sync::Arc<[i32]> = file
+                        .fields
+                        .iter()
+                        .map(|field| if replaced.contains(field) { -2 } else { *field })
+                        .collect::<Vec<_>>()
+                        .into();
+                    file.fields = new_fields;
+                }
+                new_frag
+                    .files
+                    .retain(|file| file.fields.iter().any(|&field| field != -2));
                 new_frag.files.push((*data_file).clone());
             }
             fragments.push(new_frag);
