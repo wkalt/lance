@@ -3322,16 +3322,12 @@ impl Dataset {
         let file_name = format!("{}.lance", Uuid::new_v4());
         let path = self.data_dir().join(file_name.as_str());
 
-        let lance_schema = schema.clone();
-        let field_ids: Vec<i32> = lance_schema.fields.iter().map(|f| f.id).collect();
-        let column_indices: Vec<i32> = (0..field_ids.len() as i32).collect();
-
         let format_version = self.manifest.data_storage_format.lance_file_version()?;
 
         let writer = self.object_store.create(&path).await?;
         let mut file_writer = FileWriter::try_new(
             writer,
-            lance_schema,
+            schema.clone(),
             FileWriterOptions {
                 format_version: Some(format_version),
                 ..Default::default()
@@ -3342,7 +3338,16 @@ impl Dataset {
             let batch = batch_result?;
             file_writer.write_batch(&batch).await?;
         }
+        let field_id_mapping = file_writer.field_id_to_column_indices().to_vec();
         file_writer.finish().await?;
+        let field_ids: Vec<i32> = field_id_mapping
+            .iter()
+            .map(|(field_id, _)| *field_id as i32)
+            .collect();
+        let column_indices: Vec<i32> = field_id_mapping
+            .iter()
+            .map(|(_, column_index)| *column_index as i32)
+            .collect();
 
         let resolved = format_version.resolve();
         let (major, minor) = match resolved {
