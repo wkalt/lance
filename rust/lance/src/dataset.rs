@@ -3315,6 +3315,22 @@ impl Dataset {
         data: impl Iterator<Item = Result<RecordBatch>> + Send,
         schema: &lance_core::datatypes::Schema,
     ) -> Result<transaction::DataReplacementGroup> {
+        self.write_fragment_column_stream(fragment_id, stream::iter(data), schema)
+            .await
+    }
+
+    /// Streaming variant of [`Self::write_fragment_column`]: pulls batches from
+    /// an async `Stream` one at a time. A caller that assembles the replacement
+    /// column from many out-of-line sources (e.g. checkpoint files fetched from
+    /// an object store) then holds only one batch in memory rather than
+    /// materializing the whole column up front. The iterator entry point above
+    /// wraps a synchronous iterator as a stream.
+    pub async fn write_fragment_column_stream(
+        &self,
+        fragment_id: u64,
+        data: impl Stream<Item = Result<RecordBatch>> + Send,
+        schema: &lance_core::datatypes::Schema,
+    ) -> Result<transaction::DataReplacementGroup> {
         use lance_file::writer::{FileWriter, FileWriterOptions};
         use lance_table::format::DataFile;
         use uuid::Uuid;
@@ -3334,7 +3350,8 @@ impl Dataset {
             },
         )?;
 
-        for batch_result in data {
+        let mut data = std::pin::pin!(data);
+        while let Some(batch_result) = data.next().await {
             let batch = batch_result?;
             file_writer.write_batch(&batch).await?;
         }
