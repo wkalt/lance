@@ -3042,11 +3042,9 @@ impl Dataset {
             .map(|(_, column_index)| *column_index as i32)
             .collect();
 
-        let resolved = format_version.resolve();
-        let (major, minor) = match resolved {
+        let (major, minor) = match file_writer.version().resolve() {
             lance_encoding::version::LanceFileVersion::Legacy => (0, 1),
-            lance_encoding::version::LanceFileVersion::V2_0 => (2, 0),
-            _ => (2, 1),
+            version => version.to_numbers(),
         };
 
         let data_file = DataFile {
