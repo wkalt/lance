@@ -2623,14 +2623,6 @@ impl Transaction {
         }
     }
 
-    fn is_vector_index(index: &IndexMetadata) -> bool {
-        if let Some(details) = &index.index_details {
-            details.type_url.ends_with("VectorIndexDetails")
-        } else {
-            false
-        }
-    }
-
     /// Remove data files that only contain tombstoned fields (-2)
     /// These files no longer contain any live data and can be safely dropped
     fn remove_tombstoned_data_files(fragments: &mut [Fragment]) {
@@ -2701,15 +2693,19 @@ impl Transaction {
                     });
 
                 if non_empty_indices.is_empty() {
-                    // All indices are empty - for scalar indices, keep only the first (oldest) one
-                    // For vector indices, remove all of them
+                    // All indices are empty -- keep only the oldest definition.
+                    //
+                    // Fork divergence from upstream Lance, which drops empty
+                    // VECTOR indexes here. We retain the *definition* so a full
+                    // materialized-view refresh -- which replaces every fragment
+                    // and thus empties the index -- never leaves the view without
+                    // its declared index. The scanner flat-scans unindexed
+                    // fragments (an empty index is still correct), and the
+                    // planner reindexes once enough rows accrue.
                     let mut sorted_indices = empty_indices;
                     sorted_indices.sort_by_key(|index: &&IndexMetadata| index.dataset_version); // Sort by ascending dataset_version
 
-                    // Keep only the first (oldest) if it's not a vector index
-                    if let Some(oldest) = sorted_indices.first()
-                        && !Self::is_vector_index(oldest)
-                    {
+                    if let Some(oldest) = sorted_indices.first() {
                         uuids_to_keep.insert(oldest.uuid);
                     }
                 } else {
@@ -2719,18 +2715,12 @@ impl Transaction {
                     }
                 }
             } else {
-                // Single index - keep it unless it's an empty vector index
+                // Single index whose column is still in schema: keep it,
+                // including an empty vector index (fork divergence -- see the
+                // all-empty note above; needed so a full MV refresh never drops
+                // the view's declared vector index).
                 if let Some(index) = same_name_indices.first() {
-                    let is_empty = index
-                        .effective_fragment_bitmap(&existing_fragments)
-                        .as_ref()
-                        .is_none_or(|bitmap| bitmap.is_empty());
-                    let is_vector = Self::is_vector_index(index);
-
-                    // Keep the index unless it's an empty vector index
-                    if !is_empty || !is_vector {
-                        uuids_to_keep.insert(index.uuid);
-                    }
+                    uuids_to_keep.insert(index.uuid);
                 }
             }
         }
@@ -4497,7 +4487,7 @@ mod tests {
     }
 
     #[test]
-    fn test_retain_single_empty_vector_index() {
+    fn test_retain_single_empty_vector_index_is_kept() {
         let schema = create_test_schema(&[1]);
         let fragments = vec![Fragment::new(1)];
 
@@ -4511,8 +4501,10 @@ mod tests {
 
         Transaction::retain_relevant_indices(&mut indices, &schema, &fragments);
 
-        // Single empty vector index should be removed
-        assert_eq!(indices.len(), 0);
+        // Fork behavior: a single empty vector index DEFINITION is retained, so
+        // a full MV refresh (which empties every index) never leaves the view
+        // without its declared index. Upstream Lance drops it here.
+        assert_eq!(indices.len(), 1);
     }
 
     #[test]
@@ -4555,9 +4547,11 @@ mod tests {
         Transaction::retain_relevant_indices(&mut scalar_indices, &schema, &fragments);
         Transaction::retain_relevant_indices(&mut vector_indices, &schema, &fragments);
 
-        // Scalar should be kept, vector should be removed
+        // Both kept: a None bitmap is treated as empty, and the fork retains
+        // empty index definitions regardless of type (see
+        // test_retain_single_empty_vector_index_is_kept).
         assert_eq!(scalar_indices.len(), 1);
-        assert_eq!(vector_indices.len(), 0);
+        assert_eq!(vector_indices.len(), 1);
     }
 
     #[test]
@@ -4579,7 +4573,7 @@ mod tests {
     }
 
     #[test]
-    fn test_retain_multiple_empty_vector_indices_removes_all() {
+    fn test_retain_multiple_empty_vector_indices_keeps_oldest() {
         let schema = create_test_schema(&[1]);
         let fragments = vec![Fragment::new(1)];
 
@@ -4591,8 +4585,10 @@ mod tests {
 
         Transaction::retain_relevant_indices(&mut indices, &schema, &fragments);
 
-        // All empty vector indices should be removed
-        assert_eq!(indices.len(), 0);
+        // Fork behavior: keep the oldest empty vector index definition (upstream
+        // removes all empty vector indices).
+        assert_eq!(indices.len(), 1);
+        assert_eq!(indices[0].dataset_version, 1);
     }
 
     #[test]
@@ -4685,10 +4681,11 @@ mod tests {
         Transaction::retain_relevant_indices(&mut scalar_indices, &schema, &fragments);
         Transaction::retain_relevant_indices(&mut vector_indices, &schema, &fragments);
 
-        // Scalar should be kept (single index, even if effective bitmap is empty)
-        // Vector should be removed (empty effective bitmap)
+        // Both kept: a single index of any type is retained even when its
+        // effective bitmap is empty (fork behavior -- empty vector definitions
+        // are preserved; the scanner flat-scans the unindexed rows).
         assert_eq!(scalar_indices.len(), 1);
-        assert_eq!(vector_indices.len(), 0);
+        assert_eq!(vector_indices.len(), 1);
     }
 
     #[test]
@@ -4704,11 +4701,12 @@ mod tests {
 
         Transaction::retain_relevant_indices(&mut indices, &schema, &fragments);
 
-        // idx_a (empty scalar) should be kept, idx_b (empty vector) removed, idx_c (non-empty) kept
-        assert_eq!(indices.len(), 2);
+        // All kept: distinct names are independent single-index groups, each
+        // retained even when empty (idx_b empty vector is now kept too).
+        assert_eq!(indices.len(), 3);
         assert!(indices.iter().any(|idx| idx.name == "idx_a"));
+        assert!(indices.iter().any(|idx| idx.name == "idx_b"));
         assert!(indices.iter().any(|idx| idx.name == "idx_c"));
-        assert!(!indices.iter().any(|idx| idx.name == "idx_b"));
     }
 
     #[test]
@@ -4724,7 +4722,7 @@ mod tests {
     }
 
     #[test]
-    fn test_retain_all_indices_removed() {
+    fn test_retain_only_bad_field_removed() {
         let schema = create_test_schema(&[1]);
         let fragments = vec![Fragment::new(1)];
 
@@ -4736,7 +4734,12 @@ mod tests {
 
         Transaction::retain_relevant_indices(&mut indices, &schema, &fragments);
 
-        assert_eq!(indices.len(), 0);
+        // vec1 and vec2 are distinct single-index groups -- each empty vector
+        // definition is now kept. Only idx3 (field 99 not in schema) is dropped.
+        assert_eq!(indices.len(), 2);
+        assert!(indices.iter().any(|idx| idx.name == "vec1"));
+        assert!(indices.iter().any(|idx| idx.name == "vec2"));
+        assert!(!indices.iter().any(|idx| idx.name == "idx3"));
     }
 
     #[test]
@@ -4751,8 +4754,8 @@ mod tests {
             create_test_index("idx_a", 1, 3, Some(RoaringBitmap::new()), false),
             create_test_index("idx_a", 1, 1, Some(RoaringBitmap::new()), false), // Oldest
             create_test_index("idx_a", 1, 2, Some(RoaringBitmap::new()), false),
-            // Group "vec_b" - all empty vectors, remove all
-            create_test_index("vec_b", 1, 1, Some(RoaringBitmap::new()), true),
+            // Group "vec_b" - all empty vectors, keep oldest
+            create_test_index("vec_b", 1, 1, Some(RoaringBitmap::new()), true), // Oldest
             create_test_index("vec_b", 1, 2, Some(RoaringBitmap::new()), true),
             // Group "idx_c" - mixed empty/non-empty, keep non-empty
             create_test_index("idx_c", 2, 1, Some(RoaringBitmap::new()), false),
@@ -4766,8 +4769,8 @@ mod tests {
 
         Transaction::retain_relevant_indices(&mut indices, &schema, &fragments);
 
-        // Expected: frag_reuse, idx_a (oldest), idx_c (2 non-empty), idx_d = 5 total
-        assert_eq!(indices.len(), 5);
+        // Expected: frag_reuse, idx_a (oldest), vec_b (oldest), idx_c (2 non-empty), idx_d = 6 total
+        assert_eq!(indices.len(), 6);
 
         // Verify system index kept
         assert!(indices.iter().any(|idx| idx.name == FRAG_REUSE_INDEX_NAME));
@@ -4777,8 +4780,10 @@ mod tests {
         assert_eq!(idx_a_indices.len(), 1);
         assert_eq!(idx_a_indices[0].dataset_version, 1);
 
-        // Verify vec_b all removed
-        assert!(!indices.iter().any(|idx| idx.name == "vec_b"));
+        // Verify vec_b kept oldest only (empty vector definitions retained)
+        let vec_b_indices: Vec<_> = indices.iter().filter(|idx| idx.name == "vec_b").collect();
+        assert_eq!(vec_b_indices.len(), 1);
+        assert_eq!(vec_b_indices[0].dataset_version, 1);
 
         // Verify idx_c kept non-empty only
         let idx_c_indices: Vec<_> = indices.iter().filter(|idx| idx.name == "idx_c").collect();
