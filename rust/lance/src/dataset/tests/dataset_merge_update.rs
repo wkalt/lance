@@ -423,6 +423,88 @@ async fn test_write_fragment_column_records_dataset_storage_version(
     assert!(saw_output_file, "committed output file should be present");
 }
 
+/// Data-integrity regression: a column backfill computes per-fragment column
+/// replacements, then a concurrent compaction rewrites those fragments into new
+/// ids before the commit. `commit_column_writes` must FAIL (the replacements are
+/// orphaned) rather than silently commit a column with null data for the rewritten
+/// fragments. (Previously it iterated only the current fragments and dropped
+/// replacements that no longer matched, committing a partial/null column.)
+#[tokio::test]
+async fn test_commit_column_writes_rejects_orphaned_replacements_after_compaction() {
+    use crate::dataset::optimize::{compact_files, CompactionOptions};
+
+    let schema = Arc::new(ArrowSchema::new(vec![
+        ArrowField::new("id", DataType::Int32, false),
+        ArrowField::new("value", DataType::Int32, false),
+    ]));
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(Int32Array::from(vec![1, 2])),
+            Arc::new(Int32Array::from(vec![10, 20])),
+        ],
+    )
+    .unwrap();
+    let reader = RecordBatchIterator::new(vec![Ok(batch)], schema);
+    // One fragment per row -> two fragments to compact together.
+    let mut dataset = Dataset::write(
+        reader,
+        "memory://",
+        Some(WriteParams {
+            max_rows_per_file: 1,
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+    assert_eq!(dataset.get_fragments().len(), 2);
+    let orig_frag_ids: Vec<u64> = dataset.get_fragments().iter().map(|f| f.id() as u64).collect();
+
+    // Compute a "derived" column replacement for EACH fragment (a backfill).
+    let output_schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+        "derived",
+        DataType::Int32,
+        false,
+    )]));
+    let mut lance_schema = LanceSchema::try_from(output_schema.as_ref()).unwrap();
+    lance_schema.fields[0].id = dataset.manifest.max_field_id() + 1;
+    let mut replacements = Vec::new();
+    for (i, frag_id) in orig_frag_ids.iter().enumerate() {
+        let out = RecordBatch::try_new(
+            output_schema.clone(),
+            vec![Arc::new(Int32Array::from(vec![(i as i32 + 1) * 100]))],
+        )
+        .unwrap();
+        let r = dataset
+            .write_fragment_column(*frag_id, vec![Ok(out)].into_iter(), &lance_schema)
+            .await
+            .unwrap();
+        replacements.push(r);
+    }
+
+    // A concurrent compaction rewrites the fragments into new ids, orphaning the
+    // replacements computed above.
+    compact_files(&mut dataset, CompactionOptions::default(), None)
+        .await
+        .unwrap();
+    let new_frag_ids: Vec<u64> = dataset.get_fragments().iter().map(|f| f.id() as u64).collect();
+    assert!(
+        new_frag_ids.iter().all(|id| !orig_frag_ids.contains(id)),
+        "compaction should have produced new fragment ids; orig={orig_frag_ids:?} new={new_frag_ids:?}"
+    );
+
+    // Committing the stale replacements must FAIL rather than silently commit a
+    // 'derived' column with missing data.
+    let err = dataset
+        .commit_column_writes(replacements, &lance_schema, None)
+        .await
+        .unwrap_err();
+    assert!(
+        err.to_string().contains("no longer in the dataset"),
+        "expected orphaned-replacement data-integrity error, got: {err}"
+    );
+}
+
 #[tokio::test]
 async fn test_insert_subschema() {
     let schema = Arc::new(ArrowSchema::new(vec![

@@ -3116,10 +3116,12 @@ impl Dataset {
             }
 
             let mut fragments = Vec::new();
+            let mut applied = 0usize;
             for frag in self.get_fragments() {
                 let frag_id = frag.id() as u64;
                 let mut new_frag: Fragment = frag.metadata().clone();
                 if let Some(data_file) = replacement_map.get(&frag_id) {
+                    applied += 1;
                     // Tombstone the replaced fields in existing files (same
                     // mechanism as the update-columns path) so the new file
                     // is authoritative for fragments that already covered
@@ -3141,6 +3143,27 @@ impl Dataset {
                     new_frag.files.push((*data_file).clone());
                 }
                 fragments.push(new_frag);
+            }
+
+            // Data-integrity guard: every replacement MUST land on a current
+            // fragment. If some don't (the rebase above checked out a version
+            // where a concurrent compaction rewrote those fragments into new
+            // ids), the replacement column files for the orphaned fragments
+            // would be silently dropped, committing a column with missing
+            // (null) data. Fail loudly instead so the caller re-derives the
+            // column against the current fragments (the per-fragment write
+            // keys on fragment id + source signature, both of which change on
+            // compaction, so a re-run recomputes correctly). Without this the
+            // failure was a silent partial backfill.
+            if applied < replacement_map.len() {
+                return Err(Error::internal(format!(
+                    "commit_column_writes: {} of {} column replacements reference fragments no \
+                     longer in the dataset (concurrent compaction rewrote them after the column \
+                     was computed); refusing to commit a partial column. Re-run the backfill \
+                     against the current fragments.",
+                    replacement_map.len() - applied,
+                    replacement_map.len(),
+                )));
             }
 
             let operation = transaction::Operation::Merge { fragments, schema };
