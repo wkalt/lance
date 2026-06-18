@@ -4221,4 +4221,76 @@ mod tests {
             .unwrap();
         assert_eq!(got.values(), &[10, 200, 30, 400, 50]);
     }
+
+    #[tokio::test]
+    async fn test_commit_and_scan_column_overlay() -> Result<()> {
+        use arrow_array::{Int64Array, RecordBatchIterator};
+        use lance_table::feature_flags::FLAG_COLUMN_OVERLAYS;
+        use lance_table::io::column_overlay::write_column_overlay_file;
+
+        let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+            "v",
+            DataType::Int64,
+            true,
+        )]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(Int64Array::from(vec![10i64, 20, 30, 40, 50]))],
+        )?;
+        let test_dir = tempfile::tempdir().unwrap();
+        let test_uri = test_dir.path().to_str().unwrap();
+        let reader = RecordBatchIterator::new(vec![Ok(batch)], schema.clone());
+        let dataset = Dataset::write(reader, test_uri, None).await?;
+
+        // Build a real overlay sidecar for `v`, then commit it onto the fragment
+        // via a Merge (overlays ride existing commit ops; From<&Fragment>
+        // serializes column_overlays and the read path applies them).
+        let frag = dataset.get_fragments().pop().unwrap();
+        let field_id = dataset.schema().field("v").unwrap().id;
+        let values = Arc::new(Int64Array::from(vec![200i64, 400])) as ArrayRef;
+        let overlay = write_column_overlay_file(
+            &dataset.base,
+            frag.id() as u64,
+            field_id,
+            dataset.manifest.version,
+            &[1u32, 3],
+            values,
+            dataset.object_store.as_ref(),
+        )
+        .await?;
+
+        let mut meta = frag.metadata.clone();
+        meta.column_overlays = vec![overlay];
+        let dataset = Dataset::commit(
+            test_uri,
+            Operation::Merge {
+                schema: dataset.schema().clone(),
+                fragments: vec![meta],
+            },
+            Some(dataset.manifest.version),
+            None,
+            None,
+            Default::default(),
+            false,
+        )
+        .await?;
+
+        // The committed manifest gates overlay-unaware readers.
+        assert_ne!(
+            dataset.manifest.reader_feature_flags & FLAG_COLUMN_OVERLAYS,
+            0,
+            "FLAG_COLUMN_OVERLAYS must be set when a fragment has overlays"
+        );
+
+        // A full dataset scan applies the overlay.
+        let actual = dataset.scan().try_into_batch().await?;
+        let got = actual
+            .column_by_name("v")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        assert_eq!(got.values(), &[10, 200, 30, 400, 50]);
+        Ok(())
+    }
 }
