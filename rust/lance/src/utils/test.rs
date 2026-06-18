@@ -244,6 +244,7 @@ impl TestDatasetGenerator {
             id: 0,
             files,
             deletion_file: None,
+            column_overlays: Vec::new(),
             row_id_meta: None,
             physical_rows: Some(batch.num_rows()),
             last_updated_at_version_meta: None,

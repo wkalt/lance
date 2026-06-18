@@ -552,6 +552,7 @@ mod tests {
                 base_id: None,
             }],
             deletion_file: None,
+            column_overlays: Vec::new(),
             row_id_meta: None,
             physical_rows: Some(10),
             last_updated_at_version_meta: None,

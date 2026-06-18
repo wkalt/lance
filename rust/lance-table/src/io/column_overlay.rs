@@ -31,23 +31,9 @@ use object_store::path::Path;
 use rand::Rng;
 use snafu::ResultExt;
 
-pub const OVERLAYS_DIR: &str = "_overlays";
+use crate::format::ColumnOverlayFile;
 
-/// Reference to a fragment's sparse overlay for one field.
-///
-/// Mirrors [`crate::format::DeletionFile`]. The sidecar path is
-/// `{root}/_overlays/{fragment_id}-{field_id}-{read_version}-{id}.lance`.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ColumnOverlayFile {
-    /// The field id this overlay patches.
-    pub field_id: i32,
-    /// The dataset version this overlay was built from.
-    pub read_version: u64,
-    /// Opaque id to disambiguate files from concurrent writers.
-    pub id: u64,
-    /// Number of overlaid (replaced) rows.
-    pub num_overlaid_rows: usize,
-}
+pub const OVERLAYS_DIR: &str = "_overlays";
 
 /// Path of an overlay sidecar, relative to the dataset root.
 pub fn overlay_file_path(base: &Path, fragment_id: u64, overlay: &ColumnOverlayFile) -> Path {
@@ -138,7 +124,8 @@ pub async fn write_column_overlay_file(
         field_id,
         read_version,
         id,
-        num_overlaid_rows: offsets.len(),
+        num_overlaid_rows: Some(offsets.len()),
+        base_id: None,
     };
     let path = overlay_file_path(base, fragment_id, &overlay);
     let bytes = encode_overlay(offsets, values)?;
@@ -161,9 +148,9 @@ pub async fn read_column_overlay_file(
 /// Patch `column_name` of `batch` with an overlay.
 ///
 /// `batch` covers fragment-local offsets `[batch_start_offset, batch_start_offset
-/// + batch.num_rows())`. For every overlay offset that falls in that range, the
-/// column's value at the corresponding position is replaced by the overlay value
-/// (overlay wins). Type-generic via concat + take, so it works for any field type.
+/// plus batch.num_rows())`. For every overlay offset in that range, the column's
+/// value at the corresponding position is replaced by the overlay value (overlay
+/// wins). Type-generic via concat + take, so it works for any field type.
 pub fn apply_overlay_to_batch(
     batch: &RecordBatch,
     column_name: &str,
@@ -278,7 +265,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(overlay.field_id, 10);
-        assert_eq!(overlay.num_overlaid_rows, 2);
+        assert_eq!(overlay.num_overlaid_rows, Some(2));
         let (off, val) = read_column_overlay_file(&base, 3, &overlay, &store)
             .await
             .unwrap();

@@ -3436,6 +3436,7 @@ mod tests {
             id: 0,
             files: vec![external_file, local_file],
             deletion_file: None,
+            column_overlays: Vec::new(),
             row_id_meta: None,
             physical_rows: Some(0),
             created_at_version_meta: None,

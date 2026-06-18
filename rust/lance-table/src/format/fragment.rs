@@ -376,6 +376,12 @@ impl DataFileFieldInterner {
                 .map(|f| self.intern_data_file(f))
                 .collect::<Result<_>>()?,
             deletion_file: p.deletion_file.map(DeletionFile::try_from).transpose()?,
+            column_overlays: p
+                .column_overlays
+                .iter()
+                .cloned()
+                .map(ColumnOverlayFile::try_from)
+                .collect::<Result<_>>()?,
             row_id_meta: p.row_id_sequence.map(RowIdMeta::try_from).transpose()?,
             physical_rows,
             last_updated_at_version_meta,
@@ -439,6 +445,57 @@ impl TryFrom<pb::DeletionFile> for DeletionFile {
     }
 }
 
+/// Reference to a fragment's sparse overlay for one field.
+///
+/// The read/write dual of [`DeletionFile`]: a deletion vector records sparse
+/// offsets to drop, an overlay records sparse offsets to replace. The sidecar
+/// (`offset -> new value`) is merged over the base column at scan time. See
+/// [`crate::io::column_overlay`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, DeepSizeOf)]
+pub struct ColumnOverlayFile {
+    /// The field id this overlay patches.
+    pub field_id: i32,
+    /// The dataset version this overlay was built from.
+    pub read_version: u64,
+    /// Opaque id to disambiguate files from concurrent writers.
+    pub id: u64,
+    /// Number of overlaid (replaced) rows. If None, this is unknown.
+    pub num_overlaid_rows: Option<usize>,
+    /// The base path index of the overlay file, when it lives outside the dataset.
+    pub base_id: Option<u32>,
+}
+
+impl TryFrom<pb::ColumnOverlayFile> for ColumnOverlayFile {
+    type Error = Error;
+
+    fn try_from(value: pb::ColumnOverlayFile) -> Result<Self> {
+        let num_overlaid_rows = if value.num_overlaid_rows == 0 {
+            None
+        } else {
+            Some(value.num_overlaid_rows as usize)
+        };
+        Ok(Self {
+            field_id: value.field_id,
+            read_version: value.read_version,
+            id: value.id,
+            num_overlaid_rows,
+            base_id: value.base_id,
+        })
+    }
+}
+
+impl From<&ColumnOverlayFile> for pb::ColumnOverlayFile {
+    fn from(o: &ColumnOverlayFile) -> Self {
+        Self {
+            field_id: o.field_id,
+            read_version: o.read_version,
+            id: o.id,
+            num_overlaid_rows: o.num_overlaid_rows.unwrap_or_default() as u64,
+            base_id: o.base_id,
+        }
+    }
+}
+
 /// A reference to a part of a file.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, DeepSizeOf)]
 pub struct ExternalFile {
@@ -487,6 +544,10 @@ pub struct Fragment {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub deletion_file: Option<DeletionFile>,
 
+    /// Sparse per-field overlays (patches) merged over base columns at scan time.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub column_overlays: Vec<ColumnOverlayFile>,
+
     /// RowIndex
     #[serde(skip_serializing_if = "Option::is_none")]
     pub row_id_meta: Option<RowIdMeta>,
@@ -511,6 +572,7 @@ impl Fragment {
             id,
             files: vec![],
             deletion_file: None,
+            column_overlays: Vec::new(),
             row_id_meta: None,
             physical_rows: None,
             last_updated_at_version_meta: None,
@@ -550,6 +612,7 @@ impl Fragment {
             id,
             files: vec![DataFile::new_legacy(path, schema, None, None)],
             deletion_file: None,
+            column_overlays: Vec::new(),
             physical_rows,
             row_id_meta: None,
             last_updated_at_version_meta: None,
@@ -670,6 +733,12 @@ impl TryFrom<pb::DataFragment> for Fragment {
                 .map(DataFile::try_from)
                 .collect::<Result<_>>()?,
             deletion_file: p.deletion_file.map(DeletionFile::try_from).transpose()?,
+            column_overlays: p
+                .column_overlays
+                .iter()
+                .cloned()
+                .map(ColumnOverlayFile::try_from)
+                .collect::<Result<_>>()?,
             row_id_meta: p.row_id_sequence.map(RowIdMeta::try_from).transpose()?,
             physical_rows,
             last_updated_at_version_meta: p
@@ -717,6 +786,11 @@ impl From<&Fragment> for pb::DataFragment {
             id: f.id,
             files: f.files.iter().map(pb::DataFile::from).collect(),
             deletion_file,
+            column_overlays: f
+                .column_overlays
+                .iter()
+                .map(pb::ColumnOverlayFile::from)
+                .collect(),
             row_id_sequence,
             physical_rows: f.physical_rows.unwrap_or_default() as u64,
             last_updated_at_version_sequence,

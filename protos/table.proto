@@ -346,6 +346,12 @@ message DataFragment {
   // deletion tombstones. To compute the current number of rows, subtract
   // `deletion_file.num_deleted_rows` from this value.
   uint64 physical_rows = 4;
+
+  // Sparse column overlays: per-field sidecars that replace (patch) the values of
+  // a subset of this fragment's rows for one field, merged over the base column at
+  // scan time. The read/write dual of `deletion_file`. Reading a fragment with
+  // overlays requires the COLUMN_OVERLAYS reader feature flag.
+  repeated ColumnOverlayFile column_overlays = 11;
 }
 
 message DataFile {
@@ -464,6 +470,33 @@ message DeletionFile {
   // path of the deletion file.
   optional uint32 base_id = 7;
 } // DeletionFile
+
+// Column Overlay File
+//
+// A sparse "delta" of a single field for a fragment: it stores (row_offset ->
+// new_value) for a subset of the fragment's rows, merged over the base column at
+// scan time (overlay value wins). The read/write dual of DeletionFile -- a
+// deletion vector records sparse offsets to drop, an overlay records sparse
+// offsets to replace.
+//
+// The sidecar path is constructed as:
+//   {root}/_overlays/{fragment_id}-{field_id}-{read_version}-{id}.lance
+// and contains a single Arrow IPC batch with columns `offset: u32` (fragment-local
+// row offsets, sorted) and `value: <field type>` (nullable).
+message ColumnOverlayFile {
+  // The field id this overlay patches.
+  int32 field_id = 1;
+  // The version of the dataset this overlay was built from.
+  uint64 read_version = 2;
+  // An opaque id used to differentiate this file from others written by concurrent
+  // writers.
+  uint64 id = 3;
+  // The number of rows that are overlaid (replaced).
+  uint64 num_overlaid_rows = 4;
+  // The base path index of the overlay file. Used when the file is imported or
+  // referred from another dataset.
+  optional uint32 base_id = 5;
+} // ColumnOverlayFile
 
 message ExternalFile {
   // Path to the file, relative to the root of the table.

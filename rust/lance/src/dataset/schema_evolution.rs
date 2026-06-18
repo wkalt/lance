@@ -1042,6 +1042,7 @@ mod test {
                         files: vec![],
                         id: 0,
                         deletion_file: None,
+                        column_overlays: Vec::new(),
                         row_id_meta: None,
                         physical_rows: Some(50),
                         last_updated_at_version_meta: None,

@@ -60,6 +60,7 @@ fn make_uniform_pb_fragments(n: u64, num_fields: usize) -> Vec<pb::DataFragment>
                 base_id: None,
             }],
             deletion_file: None,
+            column_overlays: Vec::new(),
             row_id_sequence: None,
             physical_rows: 1000,
             last_updated_at_version_sequence: Some(
@@ -136,6 +137,7 @@ fn make_diverse_pb_fragments(
                     base_id: None,
                 }],
                 deletion_file: None,
+                column_overlays: Vec::new(),
                 row_id_sequence: None,
                 physical_rows: 1000,
                 last_updated_at_version_sequence: Some(
