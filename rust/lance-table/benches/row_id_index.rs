@@ -296,6 +296,7 @@ fn bench_apply_row_id(c: &mut Criterion) {
         created_at_sequence: None,
         make_deletions_null: false,
         total_num_rows: num_rows() as u32,
+        column_overlays: Vec::new(),
     };
 
     group.bench_function("ApplyRowId", |b| {

@@ -19,6 +19,7 @@ use lance_core::{
 use lance_io::ReadBatchParams;
 use tracing::instrument;
 
+use crate::io::column_overlay::{ColumnOverlayData, apply_overlay_with_offsets};
 use crate::rowids::RowIdSequence;
 
 pub type ReadBatchFut = BoxFuture<'static, Result<RecordBatch>>;
@@ -238,6 +239,9 @@ pub struct RowIdAndDeletesConfig {
     ///
     /// This is needed to convert ReadbatchParams::RangeTo into a valid range
     pub total_num_rows: u32,
+    /// Sparse column overlays to merge over base columns (overlay value wins),
+    /// applied before row-id/addr synthesis and deletion filtering.
+    pub column_overlays: Vec<ColumnOverlayData>,
 }
 
 impl RowIdAndDeletesConfig {
@@ -272,6 +276,37 @@ pub fn apply_row_id_and_deletes(
         || has_deletions;
 
     let num_rows = batch.num_rows() as u32;
+
+    // Apply sparse column overlays before row-id/addr synthesis and deletion
+    // filtering. Overlays are keyed by fragment-local row offset; map each batch
+    // row to its offset via the same selection used for row addresses, so this is
+    // correct for range/take/indices scans (not just contiguous reads).
+    let batch = if config.column_overlays.is_empty() {
+        batch
+    } else {
+        let mut row_offsets: Vec<u32> = Vec::with_capacity(num_rows as usize);
+        for offset_range in config
+            .params
+            .slice(batch_offset as usize, num_rows as usize)
+            .unwrap()
+            .iter_offset_ranges()?
+        {
+            row_offsets.extend(offset_range);
+        }
+        let mut patched = batch;
+        for ov in &config.column_overlays {
+            if patched.schema().index_of(&ov.column_name).is_ok() {
+                patched = apply_overlay_with_offsets(
+                    &patched,
+                    &ov.column_name,
+                    &row_offsets,
+                    &ov.offsets,
+                    &ov.values,
+                )?;
+            }
+        }
+        patched
+    };
 
     let row_addrs =
         if should_fetch_row_addr {
@@ -505,6 +540,7 @@ mod tests {
                     created_at_sequence: None,
                     make_deletions_null: false,
                     total_num_rows: 100,
+                    column_overlays: Vec::new(),
                 };
                 let stream = super::wrap_with_row_id_and_delete(data, fragment_id, config);
                 let batches = stream.buffered(1).try_collect::<Vec<_>>().await.unwrap();
@@ -605,6 +641,7 @@ mod tests {
                                 created_at_sequence: None,
                                 make_deletions_null,
                                 total_num_rows: 100,
+                                column_overlays: Vec::new(),
                             };
                             let stream = super::wrap_with_row_id_and_delete(data, frag_id, config);
                             let batches = stream
@@ -707,6 +744,7 @@ mod tests {
             created_at_sequence: Some(seq),
             make_deletions_null: false,
             total_num_rows: 100,
+            column_overlays: Vec::new(),
         };
         let stream = super::wrap_with_row_id_and_delete(data, 0, config);
         let batches: Vec<_> = stream
@@ -776,6 +814,7 @@ mod tests {
             created_at_sequence: Some(seq),
             make_deletions_null: false,
             total_num_rows: 100,
+            column_overlays: Vec::new(),
         };
         let stream = super::wrap_with_row_id_and_delete(data, 0, config);
         let batches: Vec<_> = stream

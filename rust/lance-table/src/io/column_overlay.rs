@@ -15,6 +15,7 @@
 //! persistence, a commit op, conflict resolution, and compaction materialization
 //! are separate slices.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use arrow_array::{Array, ArrayRef, RecordBatch, UInt32Array};
@@ -158,28 +159,72 @@ pub fn apply_overlay_to_batch(
     overlay_offsets: &UInt32Array,
     overlay_values: &ArrayRef,
 ) -> Result<RecordBatch> {
+    let n = batch.num_rows();
+    let row_offsets: Vec<u32> = (0..n as u64)
+        .map(|i| (batch_start_offset + i) as u32)
+        .collect();
+    apply_overlay_with_offsets(
+        batch,
+        column_name,
+        &row_offsets,
+        overlay_offsets,
+        overlay_values,
+    )
+}
+
+/// Patch `column_name` of `batch` given the fragment-local row offset of each
+/// batch row (`row_offsets[i]` is the fragment-local offset of batch row `i`).
+///
+/// This is the general form used by the scanner: a scan selection (range, take,
+/// indices) maps batch rows to arbitrary, possibly non-contiguous fragment-local
+/// offsets, so the caller supplies the exact offsets (the same ones used to build
+/// row addresses). Where a batch row's offset has an overlay entry, its value is
+/// replaced (overlay wins). Type-generic via concat + take.
+pub fn apply_overlay_with_offsets(
+    batch: &RecordBatch,
+    column_name: &str,
+    row_offsets: &[u32],
+    overlay_offsets: &UInt32Array,
+    overlay_values: &ArrayRef,
+) -> Result<RecordBatch> {
+    debug_assert_eq!(row_offsets.len(), batch.num_rows());
     let col_idx = batch.schema().index_of(column_name)?;
     let base = batch.column(col_idx);
-    let n = base.len();
+    let base_len = base.len() as u32;
+
+    // overlay fragment-local offset -> index into overlay_values
+    let mut by_offset: HashMap<u32, u32> = HashMap::with_capacity(overlay_offsets.len());
+    for j in 0..overlay_offsets.len() {
+        by_offset.insert(overlay_offsets.value(j), j as u32);
+    }
 
     // combined = [base ... | overlay_values ...]; take picks overlay where present.
     let combined = concat(&[base.as_ref(), overlay_values.as_ref()])?;
-    let base_len = n as u32;
-    let mut idx: Vec<u32> = (0..base_len).collect();
-    let end = batch_start_offset + n as u64;
-    for j in 0..overlay_offsets.len() {
-        let off = overlay_offsets.value(j) as u64;
-        if off >= batch_start_offset && off < end {
-            let local = (off - batch_start_offset) as usize;
-            idx[local] = base_len + j as u32;
-        }
-    }
+    let idx: Vec<u32> = row_offsets
+        .iter()
+        .enumerate()
+        .map(|(i, off)| match by_offset.get(off) {
+            Some(j) => base_len + *j,
+            None => i as u32,
+        })
+        .collect();
     let take_idx = UInt32Array::from(idx);
     let patched = take(combined.as_ref(), &take_idx, None)?;
 
     let mut cols = batch.columns().to_vec();
     cols[col_idx] = patched;
     Ok(RecordBatch::try_new(batch.schema(), cols)?)
+}
+
+/// Loaded overlay for one output column, ready to apply during a scan.
+#[derive(Debug, Clone)]
+pub struct ColumnOverlayData {
+    /// Output column name to patch.
+    pub column_name: String,
+    /// Fragment-local row offsets (sorted) that this overlay replaces.
+    pub offsets: Arc<UInt32Array>,
+    /// New values, aligned 1:1 with `offsets`.
+    pub values: ArrayRef,
 }
 
 #[cfg(test)]
@@ -237,6 +282,20 @@ mod tests {
         assert_eq!(got.value(0), "a");
         assert!(got.is_null(1)); // overlay can set null
         assert_eq!(got.value(2), "c");
+    }
+
+    #[test]
+    fn test_apply_overlay_non_contiguous_offsets() {
+        // A take/indices scan: batch rows map to non-contiguous, reordered
+        // fragment offsets [7, 3, 0]. Overlay patches offsets 3 and 0.
+        let batch = batch_i64("v", vec![70, 30, 10]);
+        let row_offsets = [7u32, 3, 0];
+        let offsets = UInt32Array::from(vec![0u32, 3]);
+        let values = Arc::new(Int64Array::from(vec![1000i64, 300])) as ArrayRef;
+        let out = apply_overlay_with_offsets(&batch, "v", &row_offsets, &offsets, &values).unwrap();
+        let got = out.column(0).as_any().downcast_ref::<Int64Array>().unwrap();
+        // row 0 (offset 7) unchanged; row 1 (offset 3) -> 300; row 2 (offset 0) -> 1000
+        assert_eq!(got.values(), &[70, 300, 1000]);
     }
 
     #[test]

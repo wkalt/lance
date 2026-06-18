@@ -1045,6 +1045,7 @@ mod tests {
                 num_deleted_rows: Some(1),
                 base_id: Some(2),
             }),
+            column_overlays: Vec::new(),
             row_id_meta: None,
             physical_rows: Some(3),
             last_updated_at_version_meta: None,

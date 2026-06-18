@@ -63,6 +63,7 @@ use super::{NewColumnTransform, WriteParams, schema_evolution};
 use crate::dataset::Dataset;
 use crate::dataset::fragment::session::FragmentSession;
 use crate::io::deletion::read_dataset_deletion_file;
+use lance_table::io::column_overlay::{ColumnOverlayData, read_column_overlay_file};
 
 /// Result of [`FileFragment::update_columns_with_offsets`]: updated fragment metadata, modified field ids,
 /// and physical row offsets that matched the join (for stable row-id version metadata).
@@ -937,6 +938,7 @@ impl FileFragment {
             num_physical_rows,
             Arc::new(self.metadata.clone()),
         )?;
+        reader.column_overlays = self.load_column_overlays(projection).await?;
 
         if read_config.with_row_id {
             reader.with_row_id();
@@ -1441,6 +1443,35 @@ impl FileFragment {
             read_dataset_deletion_file(&self.dataset, self.id() as u64, deletion_file).await?;
 
         Ok(Some(deletion_vector))
+    }
+
+    /// Load sparse column overlays for the projected fields (empty if none). Each
+    /// overlay sidecar is resolved to the output column name and read into
+    /// `(offsets, values)` for scan-time merge.
+    async fn load_column_overlays(&self, projection: &Schema) -> Result<Vec<ColumnOverlayData>> {
+        if self.metadata.column_overlays.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut out = Vec::new();
+        for overlay in &self.metadata.column_overlays {
+            // Skip overlays for fields that are not part of this projection.
+            let Some(field) = projection.field_by_id(overlay.field_id) else {
+                continue;
+            };
+            let (offsets, values) = read_column_overlay_file(
+                &self.dataset.base,
+                self.id() as u64,
+                overlay,
+                self.dataset.object_store.as_ref(),
+            )
+            .await?;
+            out.push(ColumnOverlayData {
+                column_name: field.name.clone(),
+                offsets: Arc::new(offsets),
+                values,
+            });
+        }
+        Ok(out)
     }
 
     /// Get the file metadata for this fragment, using the cache if available.
@@ -2004,6 +2035,10 @@ pub struct FragmentReader {
     /// The deleted row IDs
     deletion_vec: Option<Arc<DeletionVector>>,
 
+    /// Sparse column overlays (per-field patches) merged over base columns at scan
+    /// time. Empty unless the fragment has overlays for projected fields.
+    column_overlays: Vec<ColumnOverlayData>,
+
     /// The row id sequence
     ///
     /// Only populated if the stable row id feature is enabled.
@@ -2058,6 +2093,7 @@ impl Clone for FragmentReader {
                 .collect::<Vec<_>>(),
             output_schema: self.output_schema.clone(),
             deletion_vec: self.deletion_vec.clone(),
+            column_overlays: self.column_overlays.clone(),
             row_id_sequence: self.row_id_sequence.clone(),
             fragment_id: self.fragment_id,
             with_row_id: self.with_row_id,
@@ -2125,6 +2161,7 @@ impl FragmentReader {
             readers,
             output_schema,
             deletion_vec,
+            column_overlays: Vec::new(),
             row_id_sequence,
             fragment_id,
             with_row_id: false,
@@ -2377,6 +2414,7 @@ impl FragmentReader {
                 created_at_sequence: self.created_at_sequence.clone(),
                 make_deletions_null: self.make_deletions_null,
                 total_num_rows: first_reader.len() as u32,
+                column_overlays: self.column_overlays.clone(),
             },
         )?;
 
@@ -2475,6 +2513,7 @@ impl FragmentReader {
             created_at_sequence: self.created_at_sequence.clone(),
             params,
             total_num_rows,
+            column_overlays: self.column_overlays.clone(),
         };
         let output_schema = Arc::new(self.output_schema.clone());
         Ok(
@@ -2645,6 +2684,7 @@ impl FragmentReader {
             created_at_sequence: self.created_at_sequence.clone(),
             params: ReadBatchParams::Ranges(ranges),
             total_num_rows,
+            column_overlays: self.column_overlays.clone(),
         };
         let output_schema = Arc::new(self.output_schema.clone());
         Ok(
@@ -4120,5 +4160,65 @@ mod tests {
         let stats = dataset.object_store.as_ref().io_stats_incremental();
         assert_io_eq!(stats, read_iops, 1);
         assert_io_lt!(stats, read_bytes, 4096);
+    }
+
+    #[tokio::test]
+    async fn test_scan_applies_column_overlay() {
+        use arrow_array::Int64Array;
+        use lance_table::io::column_overlay::write_column_overlay_file;
+
+        let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+            "v",
+            DataType::Int64,
+            true,
+        )]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(Int64Array::from(vec![10i64, 20, 30, 40, 50]))],
+        )
+        .unwrap();
+        let dataset = InsertBuilder::new("memory://test_overlay")
+            .execute(vec![batch])
+            .await
+            .unwrap();
+
+        let fragment = dataset.get_fragments().pop().unwrap();
+        let field_id = dataset.schema().field("v").unwrap().id;
+        let values = Arc::new(Int64Array::from(vec![200i64, 400])) as ArrayRef;
+        // Overlay the rows at fragment offsets 1 and 3.
+        let overlay = write_column_overlay_file(
+            &dataset.base,
+            fragment.id() as u64,
+            field_id,
+            dataset.manifest.version,
+            &[1u32, 3],
+            values,
+            dataset.object_store.as_ref(),
+        )
+        .await
+        .unwrap();
+
+        let mut meta = fragment.metadata.clone();
+        meta.column_overlays = vec![overlay];
+        let ff = FileFragment::new(Arc::new(dataset), meta);
+
+        let reader = ff
+            .open(ff.dataset.schema(), FragReadConfig::default())
+            .await
+            .unwrap();
+        let data = reader
+            .read_all(1024)
+            .await
+            .unwrap()
+            .buffered(1)
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+        let got = data[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        assert_eq!(got.values(), &[10, 200, 30, 400, 50]);
     }
 }
