@@ -789,6 +789,9 @@ impl FromPyObject<'_, '_> for PyLance<Fragment> {
             id: ob.getattr("id")?.extract()?,
             files,
             deletion_file,
+            // Python FragmentMetadata does not yet surface column_overlays; default
+            // to none on the way in (overlays are written via the lance write path).
+            column_overlays: Vec::new(),
             physical_rows: ob.getattr("physical_rows")?.extract()?,
             row_id_meta,
             last_updated_at_version_meta,
