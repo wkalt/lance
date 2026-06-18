@@ -1,0 +1,14 @@
+warning: lance-linalg@8.0.0-beta.11: fp16kernels feature is not enabled, skipping build of fp16 kernels
+warning: lance-linalg@8.0.0-beta.11: fp16kernels feature is not enabled, skipping build of bf16 kernels
+warning: lance-linalg@8.0.0-beta.11: fp16kernels feature is not enabled, skipping build of fp16 kernels
+warning: lance-linalg@8.0.0-beta.11: fp16kernels feature is not enabled, skipping build of bf16 kernels
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 1.28s
+     Running unittests src/lib.rs (target/debug/deps/lance-eb367080c8e53598)
+
+running 1 test
+test dataset::fragment::tests::bench_overlay_write_comments has been running for over 60 seconds
+OVERLAY comments/score: matched=556712 touched_frags=5650 discovery=96.424664718s write=5.813916876s commit=442.433946ms TOTAL=102.681149594s
+test dataset::fragment::tests::bench_overlay_write_comments ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 1931 filtered out; finished in 104.08s
+

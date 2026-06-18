@@ -1,0 +1,8 @@
+💥 maturin failed
+  Caused by: Failed to parse Cargo.toml at /mnt/work/home/wyatt/work/lance-worktrees/sparse-overlay-column/Cargo.toml
+  Caused by: TOML parse error at line 1, column 1
+  |
+1 | [workspace]
+  | ^
+missing field `package`
+

@@ -1,0 +1,24 @@
+🍹 Building a mixed python/rust project
+🔗 Found pyo3 bindings with abi3 support
+🐍 Found CPython 3.13 at /home/wyatt/work/geneva-worktrees/gen-594-sparse-row-update/.venv/bin/python
+   Compiling lance-arrow v8.0.0-beta.11 (/mnt/work/home/wyatt/work/lance-worktrees/sparse-overlay-column/rust/lance-arrow)
+warning: lance-linalg@8.0.0-beta.11: fp16kernels feature is not enabled, skipping build of fp16 kernels
+warning: lance-linalg@8.0.0-beta.11: fp16kernels feature is not enabled, skipping build of bf16 kernels
+warning: lance-linalg@8.0.0-beta.11: fp16kernels feature is not enabled, skipping build of fp16 kernels
+warning: lance-linalg@8.0.0-beta.11: fp16kernels feature is not enabled, skipping build of bf16 kernels
+   Compiling lance-core v8.0.0-beta.11 (/mnt/work/home/wyatt/work/lance-worktrees/sparse-overlay-column/rust/lance-core)
+   Compiling lance-namespace v8.0.0-beta.11 (/mnt/work/home/wyatt/work/lance-worktrees/sparse-overlay-column/rust/lance-namespace)
+   Compiling lance-encoding v8.0.0-beta.11 (/mnt/work/home/wyatt/work/lance-worktrees/sparse-overlay-column/rust/lance-encoding)
+   Compiling lance-select v8.0.0-beta.11 (/mnt/work/home/wyatt/work/lance-worktrees/sparse-overlay-column/rust/lance-select)
+   Compiling lance-geo v8.0.0-beta.11 (/mnt/work/home/wyatt/work/lance-worktrees/sparse-overlay-column/rust/lance-geo)
+   Compiling lance-linalg v8.0.0-beta.11 (/mnt/work/home/wyatt/work/lance-worktrees/sparse-overlay-column/rust/lance-linalg)
+   Compiling lance-datafusion v8.0.0-beta.11 (/mnt/work/home/wyatt/work/lance-worktrees/sparse-overlay-column/rust/lance-datafusion)
+   Compiling lance-io v8.0.0-beta.11 (/mnt/work/home/wyatt/work/lance-worktrees/sparse-overlay-column/rust/lance-io)
+   Compiling lance-file v8.0.0-beta.11 (/mnt/work/home/wyatt/work/lance-worktrees/sparse-overlay-column/rust/lance-file)
+   Compiling lance-table v8.0.0-beta.11 (/mnt/work/home/wyatt/work/lance-worktrees/sparse-overlay-column/rust/lance-table)
+   Compiling lance-index v8.0.0-beta.11 (/mnt/work/home/wyatt/work/lance-worktrees/sparse-overlay-column/rust/lance-index)
+   Compiling lance v8.0.0-beta.11 (/mnt/work/home/wyatt/work/lance-worktrees/sparse-overlay-column/rust/lance)
+   Compiling lance-namespace-impls v8.0.0-beta.11 (/mnt/work/home/wyatt/work/lance-worktrees/sparse-overlay-column/rust/lance-namespace-impls)
+   Compiling pylance v8.0.0-beta.11 (/mnt/work/home/wyatt/work/lance-worktrees/sparse-overlay-column/python)
+    Finished `release` profile [optimized] target(s) in 7m 11s
+📦 Built wheel for abi3 Python ≥ 3.9 to /mnt/work/home/wyatt/work/lance-worktrees/sparse-overlay-column/python/target/wheels/pylance-8.0.0b11-cp39-abi3-manylinux_2_35_x86_64.whl

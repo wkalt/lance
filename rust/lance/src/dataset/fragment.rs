@@ -4381,6 +4381,83 @@ mod tests {
         Ok(())
     }
 
+    #[tokio::test]
+    async fn test_overlay_is_null_filter_consistency() -> Result<()> {
+        use arrow_array::{Int64Array, RecordBatchIterator};
+        use lance_table::io::column_overlay::write_column_overlay_file;
+
+        // Base v = [10, NULL, 30]; overlay fills the NULL at offset 1 -> 200.
+        let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+            "v",
+            DataType::Int64,
+            true,
+        )]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(Int64Array::from(vec![Some(10), None, Some(30)]))],
+        )?;
+        let test_dir = tempfile::tempdir().unwrap();
+        let test_uri = test_dir.path().to_str().unwrap();
+        let reader = RecordBatchIterator::new(vec![Ok(batch)], schema.clone());
+        let dataset = Dataset::write(reader, test_uri, None).await?;
+
+        let frag = dataset.get_fragments().pop().unwrap();
+        let field_id = dataset.schema().field("v").unwrap().id;
+        let values = Arc::new(Int64Array::from(vec![200i64])) as ArrayRef;
+        let overlay = write_column_overlay_file(
+            &dataset.base,
+            frag.id() as u64,
+            field_id,
+            dataset.manifest.version,
+            &[1u32],
+            values,
+            dataset.object_store.as_ref(),
+        )
+        .await?;
+        let mut meta = frag.metadata.clone();
+        meta.column_overlays = vec![overlay];
+        let dataset = Dataset::commit(
+            test_uri,
+            Operation::Merge {
+                schema: dataset.schema().clone(),
+                fragments: vec![meta],
+            },
+            Some(dataset.manifest.version),
+            None,
+            None,
+            Default::default(),
+            false,
+        )
+        .await?;
+
+        // Unfiltered scan must reflect the overlay: [10, 200, 30], no nulls.
+        let all = dataset.scan().try_into_batch().await?;
+        let v = all
+            .column_by_name("v")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        assert_eq!(v.null_count(), 0, "overlay should have filled the null");
+        assert_eq!(v.values(), &[10, 200, 30]);
+
+        // KEY: does a filter on the overlaid column reflect the overlay? After the
+        // overlay fills offset 1, `v IS NULL` should match NOTHING.
+        let mut scan = dataset.scan();
+        scan.filter("v IS NULL")?;
+        let null_rows = scan.try_into_batch().await?;
+        println!(
+            "v IS NULL after overlay -> {} rows (0 = overlay-aware filter; 1 = filter saw base null)",
+            null_rows.num_rows()
+        );
+        assert_eq!(
+            null_rows.num_rows(),
+            0,
+            "filter on overlaid column must reflect the overlay (re-run backfill correctness)"
+        );
+        Ok(())
+    }
+
     /// Live overlay-write benchmark on the real comments_srid (557M, 5657 frags).
     /// Run with: `cargo test -p lance --lib bench_overlay_write_comments --
     /// --ignored --nocapture`. Measures the overlay backfill path geneva would use
@@ -4405,7 +4482,11 @@ mod tests {
         scan.project(&Vec::<String>::new())?;
         scan.filter("key % 1000 = 0")?;
         scan.with_row_address();
-        let batches = scan.try_into_stream().await?.try_collect::<Vec<_>>().await?;
+        let batches = scan
+            .try_into_stream()
+            .await?
+            .try_collect::<Vec<_>>()
+            .await?;
         let mut by_frag: HashMap<u64, Vec<u32>> = HashMap::new();
         for b in &batches {
             let addrs = b
@@ -4431,8 +4512,8 @@ mod tests {
         for f in &frags {
             let fid = f.id() as u64;
             if let Some(offsets) = by_frag.get(&fid) {
-                let vals = Arc::new(StringArray::from(vec!["SPARSE_UPDATED"; offsets.len()]))
-                    as ArrayRef;
+                let vals =
+                    Arc::new(StringArray::from(vec!["SPARSE_UPDATED"; offsets.len()])) as ArrayRef;
                 let overlay = write_column_overlay_file(
                     &dataset.base,
                     fid,

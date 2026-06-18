@@ -718,3 +718,8 @@ error[E0063]: missing field `column_overlays` in initializer of `lance_table::fo
 788 |         Ok(Self(Fragment {
     |                 ^^^^^^^^ missing `column_overlays`
 
+For more information about this error, try `rustc --explain E0063`.
+error: could not compile `pylance` (lib) due to 1 previous error
+💥 maturin failed
+  Caused by: Failed to build a native library through cargo
+  Caused by: Cargo build finished with "exit status: 101": `env -u CARGO PYO3_BUILD_EXTENSION_MODULE="1" PYO3_ENVIRONMENT_SIGNATURE="cpython-3.13-64bit" PYO3_PYTHON="/home/wyatt/work/geneva-worktrees/gen-594-sparse-row-update/.venv/bin/python" PYTHON_SYS_EXECUTABLE="/home/wyatt/work/geneva-worktrees/gen-594-sparse-row-update/.venv/bin/python" "cargo" "rustc" "--profile" "release" "--message-format" "json-render-diagnostics" "--manifest-path" "/mnt/work/home/wyatt/work/lance-worktrees/sparse-overlay-column/python/Cargo.toml" "--lib"`
