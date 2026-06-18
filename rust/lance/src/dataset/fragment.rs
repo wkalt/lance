@@ -4293,4 +4293,91 @@ mod tests {
         assert_eq!(got.values(), &[10, 200, 30, 400, 50]);
         Ok(())
     }
+
+    #[tokio::test]
+    async fn test_compaction_materializes_overlay() -> Result<()> {
+        use crate::dataset::WriteParams;
+        use crate::dataset::optimize::{CompactionOptions, compact_files};
+        use arrow_array::{Int64Array, RecordBatchIterator};
+        use lance_table::feature_flags::FLAG_COLUMN_OVERLAYS;
+        use lance_table::io::column_overlay::write_column_overlay_file;
+
+        let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+            "v",
+            DataType::Int64,
+            true,
+        )]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(Int64Array::from((0..10).collect::<Vec<i64>>()))],
+        )?;
+        let test_dir = tempfile::tempdir().unwrap();
+        let test_uri = test_dir.path().to_str().unwrap();
+        let reader = RecordBatchIterator::new(vec![Ok(batch)], schema.clone());
+        let wp = WriteParams {
+            max_rows_per_file: 5,
+            ..Default::default()
+        };
+        let dataset = Dataset::write(reader, test_uri, Some(wp)).await?;
+        assert_eq!(dataset.get_fragments().len(), 2);
+
+        // Overlay row at fragment-0 offset 1 -> 999, committed via Merge.
+        let field_id = dataset.schema().field("v").unwrap().id;
+        let frags = dataset.get_fragments();
+        let values = Arc::new(Int64Array::from(vec![999i64])) as ArrayRef;
+        let overlay = write_column_overlay_file(
+            &dataset.base,
+            frags[0].id() as u64,
+            field_id,
+            dataset.manifest.version,
+            &[1u32],
+            values,
+            dataset.object_store.as_ref(),
+        )
+        .await?;
+        let mut meta0 = frags[0].metadata.clone();
+        meta0.column_overlays = vec![overlay];
+        let meta1 = frags[1].metadata.clone();
+        let mut dataset = Dataset::commit(
+            test_uri,
+            Operation::Merge {
+                schema: dataset.schema().clone(),
+                fragments: vec![meta0, meta1],
+            },
+            Some(dataset.manifest.version),
+            None,
+            None,
+            Default::default(),
+            false,
+        )
+        .await?;
+        assert_ne!(
+            dataset.manifest.reader_feature_flags & FLAG_COLUMN_OVERLAYS,
+            0
+        );
+
+        // Compact the two fragments. The overlay must be folded into the base.
+        compact_files(&mut dataset, CompactionOptions::default(), None).await?;
+
+        let actual = dataset.scan().try_into_batch().await?;
+        let got = actual
+            .column_by_name("v")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        assert_eq!(
+            got.values(),
+            &[0, 999, 2, 3, 4, 5, 6, 7, 8, 9],
+            "overlay must survive compaction"
+        );
+
+        // After materialization no fragment carries overlays -> flag cleared.
+        let has_overlays = dataset
+            .get_fragments()
+            .iter()
+            .any(|f| !f.metadata.column_overlays.is_empty());
+        assert!(!has_overlays, "compaction should fold overlays into base");
+        Ok(())
+    }
 }
