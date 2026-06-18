@@ -4380,4 +4380,104 @@ mod tests {
         assert!(!has_overlays, "compaction should fold overlays into base");
         Ok(())
     }
+
+    /// Live overlay-write benchmark on the real comments_srid (557M, 5657 frags).
+    /// Run with: `cargo test -p lance --lib bench_overlay_write_comments --
+    /// --ignored --nocapture`. Measures the overlay backfill path geneva would use
+    /// (discovery + per-fragment overlay write + one Merge commit) for a narrow
+    /// `score` output at 0.1% spread, then restores the dataset.
+    #[tokio::test]
+    #[ignore]
+    async fn bench_overlay_write_comments() -> Result<()> {
+        use arrow_array::{StringArray, UInt64Array};
+        use lance_table::io::column_overlay::write_column_overlay_file;
+        use std::collections::HashMap;
+        use std::time::Instant;
+
+        let uri = "/mnt/nvme2/comments_srid.lance";
+        let dataset = Dataset::open(uri).await?;
+        let base_version = dataset.manifest.version;
+        let field_id = dataset.schema().field("score").unwrap().id;
+
+        // Discovery: matched row addresses for `key % 1000 = 0` (every fragment).
+        let t = Instant::now();
+        let mut scan = dataset.scan();
+        scan.project(&Vec::<String>::new())?;
+        scan.filter("key % 1000 = 0")?;
+        scan.with_row_address();
+        let batches = scan.try_into_stream().await?.try_collect::<Vec<_>>().await?;
+        let mut by_frag: HashMap<u64, Vec<u32>> = HashMap::new();
+        for b in &batches {
+            let addrs = b
+                .column_by_name("_rowaddr")
+                .unwrap()
+                .as_any()
+                .downcast_ref::<UInt64Array>()
+                .unwrap();
+            for a in addrs.values() {
+                by_frag
+                    .entry(a >> 32)
+                    .or_default()
+                    .push((*a & 0xFFFF_FFFF) as u32);
+            }
+        }
+        let discovery = t.elapsed();
+        let matched: usize = by_frag.values().map(|v| v.len()).sum();
+
+        // Write one overlay sidecar per touched fragment + assemble Merge fragments.
+        let t2 = Instant::now();
+        let frags = dataset.get_fragments();
+        let mut new_meta = Vec::with_capacity(frags.len());
+        for f in &frags {
+            let fid = f.id() as u64;
+            if let Some(offsets) = by_frag.get(&fid) {
+                let vals = Arc::new(StringArray::from(vec!["SPARSE_UPDATED"; offsets.len()]))
+                    as ArrayRef;
+                let overlay = write_column_overlay_file(
+                    &dataset.base,
+                    fid,
+                    field_id,
+                    base_version,
+                    offsets,
+                    vals,
+                    dataset.object_store.as_ref(),
+                )
+                .await?;
+                let mut m = f.metadata.clone();
+                m.column_overlays = vec![overlay];
+                new_meta.push(m);
+            } else {
+                new_meta.push(f.metadata.clone());
+            }
+        }
+        let write = t2.elapsed();
+
+        let t3 = Instant::now();
+        let committed = Dataset::commit(
+            uri,
+            Operation::Merge {
+                schema: dataset.schema().clone(),
+                fragments: new_meta,
+            },
+            Some(base_version),
+            None,
+            None,
+            Default::default(),
+            false,
+        )
+        .await?;
+        let commit = t3.elapsed();
+        let total = t.elapsed();
+
+        println!(
+            "OVERLAY comments/score: matched={matched} touched_frags={} \
+             discovery={discovery:?} write={write:?} commit={commit:?} TOTAL={total:?}",
+            by_frag.len()
+        );
+
+        // Restore to the pre-benchmark version.
+        let mut restored = committed.checkout_version(base_version).await?;
+        restored.restore().await?;
+        Ok(())
+    }
 }

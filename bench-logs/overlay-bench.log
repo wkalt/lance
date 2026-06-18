@@ -1,0 +1,15 @@
+warning: lance-linalg@8.0.0-beta.11: fp16kernels feature is not enabled, skipping build of fp16 kernels
+warning: lance-linalg@8.0.0-beta.11: fp16kernels feature is not enabled, skipping build of bf16 kernels
+warning: lance-linalg@8.0.0-beta.11: fp16kernels feature is not enabled, skipping build of fp16 kernels
+warning: lance-linalg@8.0.0-beta.11: fp16kernels feature is not enabled, skipping build of bf16 kernels
+   Compiling lance v8.0.0-beta.11 (/mnt/work/home/wyatt/work/lance-worktrees/sparse-overlay-column/rust/lance)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 30.33s
+     Running unittests src/lib.rs (target/debug/deps/lance-eb367080c8e53598)
+
+running 1 test
+test dataset::fragment::tests::bench_overlay_write_comments has been running for over 60 seconds
+OVERLAY comments/score: matched=556712 touched_frags=5650 discovery=66.783225104s write=1.565272453s commit=199.887964ms TOTAL=68.548462246s
+test dataset::fragment::tests::bench_overlay_write_comments ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 1931 filtered out; finished in 69.19s
+

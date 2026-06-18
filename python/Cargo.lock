@@ -4618,6 +4618,7 @@ dependencies = [
  "arrow-buffer",
  "arrow-ipc",
  "arrow-schema",
+ "arrow-select",
  "async-trait",
  "aws-credential-types",
  "aws-sdk-dynamodb",
