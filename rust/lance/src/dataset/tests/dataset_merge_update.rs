@@ -433,7 +433,7 @@ async fn test_write_fragment_column_records_dataset_storage_version(
 /// replacements that no longer matched, committing a partial/null column.)
 #[tokio::test]
 async fn test_commit_column_writes_rejects_orphaned_replacements_after_compaction() {
-    use crate::dataset::optimize::{compact_files, CompactionOptions};
+    use crate::dataset::optimize::{CompactionOptions, compact_files};
 
     let schema = Arc::new(ArrowSchema::new(vec![
         ArrowField::new("id", DataType::Int32, false),
@@ -460,7 +460,11 @@ async fn test_commit_column_writes_rejects_orphaned_replacements_after_compactio
     .await
     .unwrap();
     assert_eq!(dataset.get_fragments().len(), 2);
-    let orig_frag_ids: Vec<u64> = dataset.get_fragments().iter().map(|f| f.id() as u64).collect();
+    let orig_frag_ids: Vec<u64> = dataset
+        .get_fragments()
+        .iter()
+        .map(|f| f.id() as u64)
+        .collect();
 
     // Compute a "derived" column replacement for EACH fragment (a backfill).
     let output_schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
@@ -489,7 +493,11 @@ async fn test_commit_column_writes_rejects_orphaned_replacements_after_compactio
     compact_files(&mut dataset, CompactionOptions::default(), None)
         .await
         .unwrap();
-    let new_frag_ids: Vec<u64> = dataset.get_fragments().iter().map(|f| f.id() as u64).collect();
+    let new_frag_ids: Vec<u64> = dataset
+        .get_fragments()
+        .iter()
+        .map(|f| f.id() as u64)
+        .collect();
     assert!(
         new_frag_ids.iter().all(|id| !orig_frag_ids.contains(id)),
         "compaction should have produced new fragment ids; orig={orig_frag_ids:?} new={new_frag_ids:?}"
