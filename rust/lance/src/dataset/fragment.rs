@@ -1418,6 +1418,12 @@ impl FileFragment {
         for data_file in &self.metadata.files {
             let last = -1;
             for field_id in data_file.fields.iter() {
+                // Tombstoned entries (-2) mark fields superseded by a later
+                // data file (e.g. an in-place column rewrite) and are valid
+                // in any position.
+                if *field_id == -2 {
+                    continue;
+                }
                 if *field_id <= last {
                     return Err(Error::corrupt_file(
                         self.dataset
