@@ -39,6 +39,30 @@ pub struct TransactionRebase<'a> {
     conflicting_mem_wal_compacted_sstables: Vec<CompactedSsTable>,
 }
 
+/// Whether `operation` is a projection claiming some field holds no nulls.
+fn asserts_non_null(operation: &Operation) -> bool {
+    matches!(
+        operation,
+        Operation::Project {
+            asserts_non_null: true,
+            ..
+        }
+    )
+}
+
+/// Whether `operation` can write a value into any field, and so can falsify such
+/// a claim. `Delete` only removes rows and `Rewrite` preserves the values it
+/// moves; `Merge` and `Project` already conflict with a projection elsewhere.
+fn supplies_values(operation: &Operation) -> bool {
+    matches!(
+        operation,
+        Operation::Append { .. }
+            | Operation::Update { .. }
+            | Operation::DataReplacement { .. }
+            | Operation::DataOverlay { .. }
+    )
+}
+
 impl<'a> TransactionRebase<'a> {
     pub async fn try_new(
         dataset: &Dataset,
@@ -221,6 +245,15 @@ impl<'a> TransactionRebase<'a> {
     /// Will return an error if the transaction is not valid. Otherwise, it will
     /// return Ok(()).
     pub fn check_txn(&mut self, other_transaction: &Transaction, other_version: u64) -> Result<()> {
+        // Either order: the claim was checked without the write's data.
+        let ours = &self.transaction.operation;
+        let theirs = &other_transaction.operation;
+        if (asserts_non_null(ours) && supplies_values(theirs))
+            || (supplies_values(ours) && asserts_non_null(theirs))
+        {
+            return Err(self.retryable_conflict_err(other_transaction, other_version));
+        }
+
         let op = &self.transaction.operation;
         match op {
             Operation::Delete { .. } => self.check_delete_txn(other_transaction, other_version),
@@ -3492,6 +3525,85 @@ mod tests {
                     result.is_ok(),
                     "update should be compatible with {other:?}, got {result:?}"
                 );
+            }
+        }
+    }
+
+    /// A claim conflicts with any write that can supply values, either order.
+    #[test]
+    fn test_non_null_claim_barrier() {
+        use crate::dataset::transaction::{DataOverlayGroup, UpdateMode};
+        use lance_table::format::overlay::{DataOverlayFile, OverlayCoverage};
+        use roaring::RoaringBitmap;
+
+        let file = || DataFile::new_legacy_from_fields("w.lance", vec![0], None);
+        let writers = [
+            (
+                "append",
+                Operation::Append {
+                    fragments: vec![Fragment::new(1)],
+                },
+            ),
+            (
+                "update",
+                Operation::Update {
+                    removed_fragment_ids: vec![],
+                    updated_fragments: vec![Fragment::new(0)],
+                    new_fragments: vec![],
+                    fields_modified: vec![0],
+                    compacted_sstables: Vec::new(),
+                    fields_for_preserving_frag_bitmap: vec![],
+                    update_mode: Some(UpdateMode::RewriteColumns),
+                    inserted_rows_filter: None,
+                    updated_fragment_offsets: None,
+                },
+            ),
+            (
+                "replacement",
+                Operation::DataReplacement {
+                    replacements: vec![DataReplacementGroup(0, file())],
+                },
+            ),
+            (
+                "overlay",
+                Operation::DataOverlay {
+                    groups: vec![DataOverlayGroup {
+                        fragment_id: 0,
+                        overlays: vec![DataOverlayFile {
+                            data_file: file(),
+                            coverage: OverlayCoverage::dense(RoaringBitmap::from_iter([0u32])),
+                            committed_version: 0,
+                        }],
+                    }],
+                },
+            ),
+        ];
+
+        for (writer_name, writer) in &writers {
+            for claims in [true, false] {
+                let project = Operation::Project {
+                    schema: lance_core::datatypes::Schema::default(),
+                    asserts_non_null: claims,
+                };
+                for (order, ours, theirs) in [
+                    ("project-rebasing", project.clone(), writer.clone()),
+                    ("writer-rebasing", writer.clone(), project.clone()),
+                ] {
+                    let mut rebase = TransactionRebase {
+                        transaction: Transaction::new(0, ours.clone(), None),
+                        initial_fragments: HashMap::new(),
+                        modified_fragment_ids: modified_fragment_ids(&ours).collect::<HashSet<_>>(),
+                        affected_rows: None,
+                        conflicting_frag_reuse_indices: Vec::new(),
+                        conflicting_mem_wal_compacted_sstables: Vec::new(),
+                    };
+                    let result = rebase.check_txn(&Transaction::new(0, theirs, None), 1);
+                    assert_eq!(
+                        matches!(result, Err(Error::RetryableCommitConflict { .. })),
+                        claims,
+                        "{writer_name}/claims={claims}/{order}: got {result:?}"
+                    );
+                }
             }
         }
     }

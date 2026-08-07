@@ -150,6 +150,10 @@ message Transaction {
   message Project {
     // The new schema
     repeated lance.file.Field schema = 1;
+    // Set when this projection makes a field non-nullable, asserting it holds
+    // no nulls. A rename or a drop asserts nothing and sets false. Absent means
+    // the writer predates the field, so the claim is unknown.
+    optional bool asserts_non_null = 2;
   }
 
   // An operation that restores a dataset to a previous version.

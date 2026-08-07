@@ -482,8 +482,16 @@ impl FromPyObject<'_, '_> for PyLance<Operation> {
             }
             "Project" => {
                 let schema = extract_schema(&ob.getattr("schema")?)?;
+                // Absent on operations predating the field; absent asserts nothing.
+                let asserts_non_null = ob
+                    .getattr("asserts_non_null")
+                    .and_then(|v| v.extract())
+                    .unwrap_or(false);
 
-                let op = Operation::Project { schema };
+                let op = Operation::Project {
+                    schema,
+                    asserts_non_null,
+                };
                 Ok(Self(op))
             }
             "UpdateConfig" => {
@@ -674,12 +682,15 @@ impl<'py> IntoPyObject<'py> for PyLance<&Operation> {
                     .expect("Failed to get CreateIndex class");
                 cls.call1((new_indices_py, removed_indices_py))
             }
-            Operation::Project { schema } => {
+            Operation::Project {
+                schema,
+                asserts_non_null,
+            } => {
                 let schema_py = LanceSchema(schema.clone());
                 let cls = namespace
                     .getattr("Project")
                     .expect("Failed to get Project class");
-                cls.call1((schema_py,))
+                cls.call1((schema_py, *asserts_non_null))
             }
             Operation::ReserveFragments { num_fragments } => {
                 if let Ok(cls) = namespace.getattr("ReserveFragments") {

@@ -708,6 +708,7 @@ pub(super) async fn alter_columns(
 
     // Mapping of old to new fields that need to be casted.
     let mut cast_fields: Vec<(Field, Field)> = Vec::new();
+    let mut asserts_non_null = false;
 
     let mut next_field_id = dataset.manifest.max_field_id() + 1;
     let version = dataset.manifest.data_storage_format.lance_file_version()?;
@@ -725,6 +726,8 @@ pub(super) async fn alter_columns(
             && !nullable
         {
             validate_no_nulls_before_making_non_nullable(dataset, &alteration.path).await?;
+            // A write since this version can falsify it, so record the claim.
+            asserts_non_null = true;
         }
 
         let field_dest = new_schema.mut_field_by_id(field_src.id).unwrap();
@@ -796,11 +799,22 @@ pub(super) async fn alter_columns(
         }
     }
 
+    if asserts_non_null && !cast_fields.is_empty() {
+        return Err(Error::invalid_input(
+            "cannot make a column non-nullable and cast columns in the same call: \
+             the cast commits as a Merge, which cannot carry the non-null claim. \
+             Apply the cast first, then the nullability change",
+        ));
+    }
+
     // If we aren't casting a column, we don't need to touch the fragments.
     let transaction = if cast_fields.is_empty() {
         Transaction::new(
             dataset.manifest.version,
-            Operation::Project { schema: new_schema },
+            Operation::Project {
+                schema: new_schema,
+                asserts_non_null,
+            },
             // TODO: Make it possible to alter blob columns
             /*blob_op= */ None,
         )
@@ -918,7 +932,10 @@ pub(super) async fn drop_columns(dataset: &mut Dataset, columns: &[&str]) -> Res
 
     let transaction = Transaction::new(
         dataset.manifest.version,
-        Operation::Project { schema: new_schema },
+        Operation::Project {
+            schema: new_schema,
+            asserts_non_null: false,
+        },
         /*blob_op= */ None,
     );
 

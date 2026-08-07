@@ -470,13 +470,19 @@ fn convert_to_java_operation_inner<'local>(
                 ],
             )?)
         }
-        Operation::Project { schema } => {
+        Operation::Project {
+            schema,
+            asserts_non_null,
+        } => {
             let java_schema = convert_to_java_schema(env, schema)?;
 
             Ok(env.new_object(
                 "org/lance/operation/Project",
-                "(Lorg/apache/arrow/vector/types/pojo/Schema;)V",
-                &[JValue::Object(&java_schema)],
+                "(Lorg/apache/arrow/vector/types/pojo/Schema;Z)V",
+                &[
+                    JValue::Object(&java_schema),
+                    JValue::Bool(asserts_non_null as u8),
+                ],
             )?)
         }
         Operation::Rewrite {
@@ -1044,6 +1050,7 @@ fn convert_to_rust_operation(
     let op_name = env.get_string_from_method(java_operation, "name")?;
     let op = match op_name.as_str() {
         "Project" => Operation::Project {
+            asserts_non_null: env.get_boolean_from_method(java_operation, "assertsNonNull")?,
             schema: convert_schema_from_operation(
                 env,
                 java_operation,

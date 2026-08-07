@@ -455,8 +455,15 @@ pub enum Operation {
         updated_fragment_offsets: Option<UpdatedFragmentOffsets>,
     },
 
-    /// Project to a new schema. This only changes the schema, not the data.
-    Project { schema: Schema },
+    /// Project to a new schema.
+    Project {
+        schema: Schema,
+        /// Set when this projection makes a field non-nullable, claiming it
+        /// holds no nulls. The producer checked that by scanning at its read
+        /// version, so a concurrent write can falsify it. False for a rename or
+        /// a drop, which assert nothing.
+        asserts_non_null: bool,
+    },
 
     /// Update the dataset configuration.
     UpdateConfig {
@@ -697,7 +704,16 @@ impl PartialEq for Operation {
                     && a_inserted_rows_filter == b_inserted_rows_filter
                     && a_updated_fragment_offsets == b_updated_fragment_offsets
             }
-            (Self::Project { schema: a }, Self::Project { schema: b }) => a == b,
+            (
+                Self::Project {
+                    schema: a,
+                    asserts_non_null: a_asserts,
+                },
+                Self::Project {
+                    schema: b,
+                    asserts_non_null: b_asserts,
+                },
+            ) => a == b && a_asserts == b_asserts,
             (
                 Self::UpdateConfig {
                     config_updates: a_config,
@@ -3525,11 +3541,16 @@ impl TryFrom<pb::Transaction> for Transaction {
                     }
                 },
             },
-            Some(pb::transaction::Operation::Project(pb::transaction::Project { schema })) => {
-                Operation::Project {
-                    schema: Schema::try_from(&Fields(schema))?,
-                }
-            }
+            Some(pb::transaction::Operation::Project(pb::transaction::Project {
+                schema,
+                asserts_non_null,
+            })) => Operation::Project {
+                schema: Schema::try_from(&Fields(schema))?,
+                // Absent means a writer that predates the claim, which may have
+                // tightened. Treat it as claiming, so a legacy tightening still
+                // conflicts; a legacy rename over-conflicts, which only retries.
+                asserts_non_null: asserts_non_null.unwrap_or(true),
+            },
             Some(pb::transaction::Operation::UpdateConfig(update_config)) => {
                 // Check if new-style fields are present
                 let has_new_fields = update_config.config_updates.is_some()
@@ -3869,11 +3890,13 @@ impl From<&Transaction> for pb::Transaction {
                     })
                     .unwrap_or_default(),
             }),
-            Operation::Project { schema } => {
-                pb::transaction::Operation::Project(pb::transaction::Project {
-                    schema: Fields::from(schema).0,
-                })
-            }
+            Operation::Project {
+                schema,
+                asserts_non_null,
+            } => pb::transaction::Operation::Project(pb::transaction::Project {
+                schema: Fields::from(schema).0,
+                asserts_non_null: Some(*asserts_non_null),
+            }),
             Operation::UpdateConfig {
                 config_updates,
                 table_metadata_updates,
@@ -4022,7 +4045,7 @@ pub fn validate_operation(manifest: Option<&Manifest>, operation: &Operation) ->
             // Fragments must contain all fields in the schema
             schema_fragments_valid(Some(manifest), &manifest.schema, fragments)
         }
-        Operation::Project { schema } => {
+        Operation::Project { schema, .. } => {
             schema_fragments_valid(Some(manifest), schema, manifest.fragments.as_ref())
         }
         Operation::Merge { fragments, schema } => {
@@ -6982,5 +7005,29 @@ mod tests {
             frag_reuse_index: None,
         };
         assert_ne!(overlay(1), rewrite);
+    }
+
+    #[test]
+    fn test_project_claim_presence() {
+        // Absent means a legacy writer that may have tightened: claim.
+        // Explicit false is a new writer's rename or drop: no claim.
+        for (encoded, expected) in [(None, true), (Some(false), false), (Some(true), true)] {
+            let txn = Transaction::try_from(pb::Transaction {
+                read_version: 1,
+                uuid: "test".to_string(),
+                operation: Some(pb::transaction::Operation::Project(
+                    pb::transaction::Project {
+                        schema: vec![],
+                        asserts_non_null: encoded,
+                    },
+                )),
+                ..Default::default()
+            })
+            .unwrap();
+            assert!(
+                matches!(txn.operation, Operation::Project { asserts_non_null, .. } if asserts_non_null == expected),
+                "encoded={encoded:?}"
+            );
+        }
     }
 }

@@ -6249,6 +6249,10 @@ class LanceOperation:
         ----------
         schema: LanceSchema
             The lance schema of the new dataset.
+        asserts_non_null: bool
+            True when this projection makes a field non-nullable, claiming it
+            holds no nulls; such a projection conflicts with concurrent writes
+            that could falsify the claim.
 
         Examples
         --------
@@ -6277,6 +6281,7 @@ class LanceOperation:
         """
 
         schema: LanceSchema
+        asserts_non_null: bool = False
 
     @dataclass
     class UpdateMap:

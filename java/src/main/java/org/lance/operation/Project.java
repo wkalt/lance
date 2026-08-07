@@ -16,14 +16,25 @@ package org.lance.operation;
 import com.google.common.base.MoreObjects;
 import org.apache.arrow.vector.types.pojo.Schema;
 
+import java.util.Objects;
+
 /**
  * Project to a new schema. This Operation only changes the schema, not the data. Note: 1. For
  * removing columns. The data will be removed after compaction. 2. Project will modify column
  * positions, not ids(a.k.a. field id)
  */
 public class Project extends SchemaOperation {
-  private Project(Schema schema) {
+  // True when this projection makes a field non-nullable, claiming it holds
+  // no nulls; such a projection conflicts with concurrent value writes.
+  private final boolean assertsNonNull;
+
+  private Project(Schema schema, boolean assertsNonNull) {
     super(schema);
+    this.assertsNonNull = assertsNonNull;
+  }
+
+  public boolean assertsNonNull() {
+    return assertsNonNull;
   }
 
   @Override
@@ -33,7 +44,23 @@ public class Project extends SchemaOperation {
 
   @Override
   public String toString() {
-    return MoreObjects.toStringHelper(this).add("schema", schema()).toString();
+    return MoreObjects.toStringHelper(this)
+        .add("schema", schema())
+        .add("assertsNonNull", assertsNonNull)
+        .toString();
+  }
+
+  @Override
+  public boolean equals(Object o) {
+    if (!super.equals(o)) {
+      return false;
+    }
+    return assertsNonNull == ((Project) o).assertsNonNull;
+  }
+
+  @Override
+  public int hashCode() {
+    return Objects.hash(schema(), assertsNonNull);
   }
 
   public static Builder builder() {
@@ -42,6 +69,7 @@ public class Project extends SchemaOperation {
 
   public static class Builder {
     private Schema schema;
+    private boolean assertsNonNull;
 
     public Builder() {}
 
@@ -50,8 +78,13 @@ public class Project extends SchemaOperation {
       return this;
     }
 
+    public Builder assertsNonNull(boolean assertsNonNull) {
+      this.assertsNonNull = assertsNonNull;
+      return this;
+    }
+
     public Project build() {
-      return new Project(schema);
+      return new Project(schema, assertsNonNull);
     }
   }
 }

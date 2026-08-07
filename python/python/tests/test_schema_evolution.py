@@ -573,3 +573,27 @@ def test_add_cols_all_null_with_sql(tmp_path: Path):
             "b": pa.int32(),
         }
     )
+
+
+def test_project_non_null_claim_round_trips(tmp_path: Path):
+    tbl = pa.table({"value": pa.array([1, 2], pa.int32())})
+    lance.write_dataset(tbl, tmp_path)
+    lance.dataset(tmp_path).alter_columns({"path": "value", "nullable": False})
+
+    # Reading the tightening back must preserve the claim, or recommitting it
+    # would silently drop the concurrency barrier.
+    txn = lance.dataset(tmp_path).read_transaction(2)
+    assert txn is not None
+    assert txn.operation.asserts_non_null is True
+
+    # A Python-built claim must reach the barrier: race it against an append.
+    written_at = lance.dataset(tmp_path).version
+    appended = lance.write_dataset(
+        pa.table({"value": pa.array([7], pa.int32())}), tmp_path, mode="append"
+    )
+    assert appended.version > written_at
+    relax = lance.LanceOperation.Project(
+        schema=txn.operation.schema, asserts_non_null=True
+    )
+    with pytest.raises(Exception, match="preempted"):
+        lance.LanceDataset.commit(tmp_path, relax, read_version=written_at)
