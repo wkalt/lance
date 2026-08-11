@@ -512,7 +512,7 @@ mod test {
     #[tokio::test]
     async fn test_concurrent_commits_are_okay() {
         // Run test 20 times to have a higher chance of catching race conditions
-        for _ in 0..20 {
+        join_all((0..20).map(|_| async {
             let sleepy_store = SleepyExternalManifestStore::new();
             let handler = ExternalManifestCommitHandler {
                 external_manifest_store: Arc::new(sleepy_store),
@@ -594,7 +594,8 @@ mod test {
                 })
                 .collect::<Vec<_>>();
             assert!(unexpected_entries.is_empty(), "{:?}", unexpected_entries);
-        }
+        }))
+        .await;
     }
 
     #[tokio::test]
