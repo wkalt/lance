@@ -10,7 +10,7 @@ use lance_io::object_store::{ObjectStore, ObjectStoreParams};
 use lance_select::RowAddrTreeMap;
 use lance_table::{
     format::{DataStorageFormat, is_detached_version},
-    io::commit::{CommitConfig, CommitHandler, ManifestNamingScheme},
+    io::commit::{CommitConfig, CommitHandler, IsolationLevel, ManifestNamingScheme},
 };
 
 use crate::io::commit::DEFAULT_COMMIT_RETRY_TIMEOUT;
@@ -166,6 +166,17 @@ impl<'a> CommitBuilder<'a> {
     ///  WARNING: turning this on will make the dataset unreadable for older
     ///  versions of Lance (prior to 0.17.0).
     /// </div>
+    /// Require that no other transaction committed since this one read.
+    ///
+    /// The default absorbs a concurrent commit when the two operations
+    /// commute. A writer whose output is derived from the state it read
+    /// wants this instead: rebasing would publish a result derived from
+    /// state that no longer exists.
+    pub fn serializable(mut self) -> Self {
+        self.commit_config.isolation = IsolationLevel::Serializable;
+        self
+    }
+
     pub fn enable_v2_manifest_paths(mut self, enable: bool) -> Self {
         self.enable_v2_manifest_paths = enable;
         self
@@ -586,7 +597,7 @@ mod tests {
     use lance_table::format::{
         DataFile, Fragment, IndexMetadata, Manifest, Transaction as TableTransaction,
     };
-    use lance_table::io::commit::{CommitError, ManifestLocation, ManifestWriter};
+    use lance_table::io::commit::{CommitError, IsolationLevel, ManifestLocation, ManifestWriter};
     use std::time::Duration;
 
     use object_store::throttle::ThrottleConfig;
@@ -619,6 +630,53 @@ mod tests {
             last_updated_at_version_meta: None,
             created_at_version_meta: None,
         }
+    }
+
+    /// A serializable transaction refuses to be rebased: whatever committed
+    /// after it read is state its output may depend on. The default level
+    /// still absorbs the same concurrent commit.
+    #[tokio::test]
+    async fn test_serializable_commit_refuses_a_concurrent_commit() {
+        let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+            "i",
+            DataType::Int32,
+            false,
+        )]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![Arc::new(Int32Array::from_iter_values(0..10_i32))],
+        )
+        .unwrap();
+        let dataset = Arc::new(
+            InsertBuilder::new("memory://serializable")
+                .execute(vec![batch])
+                .await
+                .unwrap(),
+        );
+        let read_version = dataset.manifest.version;
+
+        // Someone else commits first.
+        CommitBuilder::new(dataset.clone())
+            .execute(sample_transaction(read_version))
+            .await
+            .unwrap();
+
+        // Serializable: rejected rather than rebased.
+        let err = CommitBuilder::new(dataset.clone())
+            .serializable()
+            .execute(sample_transaction(read_version))
+            .await
+            .expect_err("a serializable commit must not rebase");
+        assert!(
+            matches!(err, Error::RetryableCommitConflict { .. }),
+            "{err:?}"
+        );
+
+        // Default: the append rebases and lands.
+        CommitBuilder::new(dataset)
+            .execute(sample_transaction(read_version))
+            .await
+            .expect("the default level absorbs a commuting commit");
     }
 
     fn sample_transaction(read_version: u64) -> Transaction {

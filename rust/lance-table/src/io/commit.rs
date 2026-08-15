@@ -1655,7 +1655,21 @@ impl Debug for TencentCosCommitHandler {
 pub struct CommitConfig {
     pub num_retries: u32,
     pub skip_auto_cleanup: bool,
-    // TODO: add isolation_level
+    pub isolation: IsolationLevel,
+}
+
+/// What a transaction requires of the state it read.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum IsolationLevel {
+    /// A concurrent commit is absorbed when the two operations commute: an
+    /// append rebases onto it and both land. Correct for a writer that
+    /// asserts nothing about prior state.
+    #[default]
+    Snapshot,
+    /// A concurrent commit fails this one. For a writer whose output is
+    /// derived from the state it read, rebasing would publish a result
+    /// derived from state that no longer exists.
+    Serializable,
 }
 
 impl Default for CommitConfig {
@@ -1663,6 +1677,7 @@ impl Default for CommitConfig {
         Self {
             num_retries: 20,
             skip_auto_cleanup: false,
+            isolation: IsolationLevel::Snapshot,
         }
     }
 }

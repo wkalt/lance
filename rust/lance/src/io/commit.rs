@@ -39,7 +39,8 @@ use lance_table::format::{
     is_detached_version, list_index_files_with_sizes, pb,
 };
 use lance_table::io::commit::{
-    CommitConfig, CommitError, CommitHandler, ManifestLocation, ManifestNamingScheme,
+    CommitConfig, CommitError, CommitHandler, IsolationLevel, ManifestLocation,
+    ManifestNamingScheme,
 };
 use lance_table::io::manifest::read_manifest;
 use rand::{Rng, rng};
@@ -1376,6 +1377,22 @@ pub(crate) async fn commit_transaction(
             // transactions that have been committed since the read_version.
             // Use small amount of backoff to handle transactions that all
             // started at exact same time better.
+
+            // A serializable transaction planned from state it read, so a
+            // concurrent commit invalidates the plan whether or not the two
+            // operations commute.
+            if commit_config.isolation == IsolationLevel::Serializable
+                && let Some((other_version, _)) = other_transactions.first()
+            {
+                return Err(Error::retryable_commit_conflict_source(
+                    *other_version,
+                    format!(
+                        "a serializable transaction that read version {read_version} \
+                         cannot be rebased onto version {other_version}"
+                    )
+                    .into(),
+                ));
+            }
 
             let mut rebase =
                 TransactionRebase::try_new(&original_dataset, transaction, affected_rows).await?;
