@@ -3,7 +3,10 @@
 
 //! Tests for Substrait aggregate
 
-use std::sync::Arc;
+use std::sync::{
+    Arc,
+    atomic::{AtomicUsize, Ordering},
+};
 
 use arrow_array::cast::AsArray;
 use arrow_array::types::{Float64Type, Int64Type};
@@ -11,6 +14,10 @@ use arrow_array::{
     FixedSizeListArray, Float32Array, Int64Array, RecordBatch, RecordBatchIterator, StringArray,
 };
 use arrow_schema::{DataType, Field, Schema as ArrowSchema};
+use datafusion::{
+    config::ConfigOptions, error::Result as DFResult, physical_optimizer::PhysicalOptimizerRule,
+    physical_plan::ExecutionPlan,
+};
 use datafusion_substrait::substrait::proto::{
     AggregateFunction, AggregateRel, Expression, FunctionArgument, Plan, PlanRel, Rel, RelRoot,
     SortField, Version,
@@ -37,9 +44,11 @@ use prost::Message;
 use tempfile::tempdir;
 
 use crate::Dataset;
+use crate::dataset::DatasetBuilder;
 use crate::dataset::scanner::AggregateExpr;
 use crate::index::DatasetIndexExt;
 use crate::index::vector::VectorIndexParams;
+use crate::session::Session;
 use crate::utils::test::{DatagenExt, FragmentCount, FragmentRowCount, assert_plan_node_equals};
 use lance_arrow::FixedSizeListArrayExt;
 use lance_index::IndexType;
@@ -249,6 +258,53 @@ async fn create_numeric_dataset(uri: &str, num_fragments: u32, rows_per_fragment
         )
         .await
         .unwrap()
+}
+
+#[derive(Debug)]
+struct CountingRule(Arc<AtomicUsize>);
+
+impl PhysicalOptimizerRule for CountingRule {
+    fn optimize(
+        &self,
+        plan: Arc<dyn ExecutionPlan>,
+        _config: &ConfigOptions,
+    ) -> DFResult<Arc<dyn ExecutionPlan>> {
+        self.0.fetch_add(1, Ordering::Relaxed);
+        Ok(plan)
+    }
+
+    fn name(&self) -> &str {
+        "counting_extension"
+    }
+
+    fn schema_check(&self) -> bool {
+        true
+    }
+}
+
+#[tokio::test]
+async fn test_session_physical_optimizer_rule() {
+    let tmp_dir = tempdir().unwrap();
+    let uri = tmp_dir.path().to_str().unwrap();
+    create_numeric_dataset(uri, 1, 10).await;
+
+    let calls = Arc::new(AtomicUsize::new(0));
+    let mut session = Session::default();
+    session.register_physical_optimizer_rule(Arc::new(CountingRule(calls.clone())));
+    let dataset = DatasetBuilder::from_uri(uri)
+        .with_session(Arc::new(session))
+        .load()
+        .await
+        .unwrap();
+
+    dataset.scan().create_plan().await.unwrap();
+    let mut scanner = dataset.scan();
+    scanner
+        .aggregate(AggregateExpr::builder().count_star().build())
+        .unwrap();
+    scanner.create_plan().await.unwrap();
+
+    assert_eq!(calls.load(Ordering::Relaxed), 2);
 }
 
 #[tokio::test]

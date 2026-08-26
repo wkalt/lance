@@ -4,6 +4,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use datafusion::physical_optimizer::PhysicalOptimizerRule;
 use lance_core::cache::{CacheBackend, LanceCache, QuickCacheBackend};
 use lance_core::deepsize::DeepSizeOf;
 use lance_core::{Error, Result};
@@ -64,6 +65,8 @@ pub struct Session {
 
     pub(crate) index_extensions: HashMap<(IndexType, String), Arc<dyn IndexExtension>>,
 
+    physical_optimizer_rules: Vec<Arc<dyn PhysicalOptimizerRule + Send + Sync>>,
+
     store_registry: Arc<ObjectStoreRegistry>,
 
     spill_store: Arc<dyn SpillStore>,
@@ -78,6 +81,8 @@ impl DeepSizeOf for Session {
         for ext in self.index_extensions.values() {
             size += ext.deep_size_of_children(context);
         }
+        size += self.physical_optimizer_rules.capacity()
+            * std::mem::size_of::<Arc<dyn PhysicalOptimizerRule + Send + Sync>>();
         size
     }
 }
@@ -96,6 +101,14 @@ impl std::fmt::Debug for Session {
             .field(
                 "index_extensions",
                 &self.index_extensions.keys().collect::<Vec<_>>(),
+            )
+            .field(
+                "physical_optimizer_rules",
+                &self
+                    .physical_optimizer_rules
+                    .iter()
+                    .map(|rule| rule.name())
+                    .collect::<Vec<_>>(),
             )
             .finish()
     }
@@ -126,6 +139,7 @@ impl Session {
                 QuickCacheBackend::with_capacity(metadata_cache_size),
             ))),
             index_extensions: HashMap::new(),
+            physical_optimizer_rules: Vec::new(),
             store_registry,
             spill_store: Arc::new(LocalSpillStore::default()),
         }
@@ -146,6 +160,7 @@ impl Session {
                 QuickCacheBackend::with_capacity(metadata_cache_size),
             ))),
             index_extensions: HashMap::new(),
+            physical_optimizer_rules: Vec::new(),
             store_registry,
             spill_store: Arc::new(LocalSpillStore::default()),
         }
@@ -174,6 +189,22 @@ impl Session {
     /// state that overflows memory (e.g. index builders).
     pub fn spill_store(&self) -> &dyn SpillStore {
         &*self.spill_store
+    }
+
+    /// Add a physical optimizer rule to every scanner using this session.
+    ///
+    /// Registered rules run in insertion order before Lance's built-in rules.
+    pub fn register_physical_optimizer_rule(
+        &mut self,
+        rule: Arc<dyn PhysicalOptimizerRule + Send + Sync>,
+    ) -> &mut Self {
+        self.physical_optimizer_rules.push(rule);
+        self
+    }
+
+    /// Return the physical optimizer rules registered for this session.
+    pub fn physical_optimizer_rules(&self) -> &[Arc<dyn PhysicalOptimizerRule + Send + Sync>] {
+        &self.physical_optimizer_rules
     }
 
     /// Create a session with custom backends for both caches.
@@ -217,6 +248,7 @@ impl Session {
             index_cache: GlobalIndexCache(index_cache),
             metadata_cache: GlobalMetadataCache(metadata_cache),
             index_extensions: HashMap::new(),
+            physical_optimizer_rules: Vec::new(),
             store_registry,
             spill_store: Arc::new(LocalSpillStore::default()),
         }

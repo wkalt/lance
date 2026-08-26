@@ -2499,6 +2499,21 @@ impl Scanner {
         )?) as Arc<dyn ExecutionPlan>)
     }
 
+    fn optimize_plan(
+        &self,
+        mut plan: Arc<dyn ExecutionPlan>,
+        options: &ConfigOptions,
+    ) -> Result<Arc<dyn ExecutionPlan>> {
+        let session = self.dataset.session();
+        for rule in session.physical_optimizer_rules() {
+            plan = rule.optimize(plan, options)?;
+        }
+        for rule in get_physical_optimizer().rules {
+            plan = rule.optimize(plan, options)?;
+        }
+        Ok(plan)
+    }
+
     #[allow(clippy::type_complexity)]
     // TODO(datafusion-54): migrate off the deprecated
     // create_aggregate_expr_and_maybe_filter to LoweredAggregateBuilder.
@@ -3008,14 +3023,11 @@ impl Scanner {
             plan = self.take(plan, agg_projection)?;
             plan = self.apply_aggregate(plan, agg).await?;
 
-            let optimizer = get_physical_optimizer();
             let mut options = ConfigOptions::default();
             options.execution.target_partitions = self
                 .target_parallelism
                 .unwrap_or_else(get_num_compute_intensive_cpus);
-            for rule in optimizer.rules {
-                plan = rule.optimize(plan, &options)?;
-            }
+            plan = self.optimize_plan(plan, &options)?;
 
             return Ok(plan);
         }
@@ -3075,14 +3087,11 @@ impl Scanner {
             plan = Arc::new(StrictBatchSizeExec::new(plan, self.get_batch_size()));
         }
 
-        let optimizer = get_physical_optimizer();
         let mut options = ConfigOptions::default();
         options.execution.target_partitions = self
             .target_parallelism
             .unwrap_or_else(get_num_compute_intensive_cpus);
-        for rule in optimizer.rules {
-            plan = rule.optimize(plan, &options)?;
-        }
+        plan = self.optimize_plan(plan, &options)?;
 
         Ok(plan)
     }
