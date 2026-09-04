@@ -10,7 +10,7 @@
 //! The buffer can later be read back during index updates to reconstruct index
 //! statistics without re-scanning the column data.
 
-use arrow_array::ArrayRef;
+use arrow_array::{ArrayRef, RecordBatch};
 use bytes::Bytes;
 use lance_core::Result;
 
@@ -30,6 +30,14 @@ pub trait IndexSeedWriter: Send + std::fmt::Debug {
     /// Observe a slice of column values as they are written to the current fragment.
     /// Called once per batch.
     fn observe_batch(&mut self, values: &ArrayRef) -> Result<()>;
+
+    /// Observe a written batch; multicolumn summaries override this method.
+    fn observe_record_batch(&mut self, batch: &RecordBatch) -> Result<()> {
+        if let Some(values) = batch.column_by_name(self.column_name()) {
+            self.observe_batch(values)?;
+        }
+        Ok(())
+    }
 
     /// Serialize accumulated state to bytes and reset for the next fragment.
     /// Returns `None` if no data was observed (empty fragment).

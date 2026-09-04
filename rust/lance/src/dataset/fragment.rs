@@ -1689,6 +1689,60 @@ impl FileFragment {
         }
     }
 
+    /// Read an ingestion seed from the file containing all requested fields.
+    /// Deletions, overlays, or missing fields yield no seed; `max_bytes` bounds the buffer.
+    pub async fn read_index_seed(
+        &self,
+        key: &str,
+        fields: &[i32],
+        max_bytes: u64,
+    ) -> Result<Option<bytes::Bytes>> {
+        if self.metadata.deletion_file.is_some() || !self.metadata.overlays.is_empty() {
+            return Ok(None);
+        }
+        let Some(file) = self
+            .metadata
+            .files
+            .iter()
+            .find(|file| fields.iter().all(|field| file.fields.contains(field)))
+        else {
+            return Ok(None);
+        };
+        let store = self.dataset.object_store_for_data_file(file).await?;
+        let path = self.dataset.data_file_dir(file)?.join(file.path.as_str());
+        let scheduler = ScanScheduler::new(store.clone(), SchedulerConfig::max_bandwidth(&store));
+        let file_scheduler = scheduler.open_file(&path, &file.file_size_bytes).await?;
+        let reader = lance_file::reader::FileReader::try_open(
+            file_scheduler,
+            None,
+            Default::default(),
+            &self.dataset.metadata_cache.file_metadata_cache(&path),
+            FileReaderOptions::default(),
+        )
+        .await?;
+        let Some(value) = reader.metadata().file_schema.metadata.get(key) else {
+            return Ok(None);
+        };
+        let index = value
+            .split(':')
+            .next()
+            .and_then(|value| value.parse::<u32>().ok())
+            .ok_or_else(|| {
+                Error::invalid_input(format!("invalid seed buffer reference for {key}"))
+            })?;
+        let descriptor = reader
+            .metadata()
+            .file_buffers
+            .get(index as usize)
+            .ok_or_else(|| Error::invalid_input(format!("missing seed buffer for {key}")))?;
+        if descriptor.size > max_bytes {
+            return Err(Error::invalid_input(format!(
+                "seed {key} exceeds {max_bytes} bytes"
+            )));
+        }
+        Ok(Some(reader.read_global_buffer(index).await?))
+    }
+
     /// Get the deletion vector for this fragment, using the cache if available.
     pub async fn get_deletion_vector(&self) -> Result<Option<Arc<DeletionVector>>> {
         let Some(deletion_file) = self.metadata.deletion_file.as_ref() else {

@@ -22,6 +22,15 @@ pub(crate) mod caches;
 pub mod index_caches;
 pub(crate) mod index_extension;
 
+/// Creates fragment seed writers from a dataset's current declarations.
+pub trait IndexSeedFactory: Send + Sync + std::fmt::Debug {
+    /// Return writers whose summaries will be embedded in appended files.
+    fn create_writers(
+        &self,
+        dataset: &crate::Dataset,
+    ) -> Result<Vec<Box<dyn lance_index::scalar::seed::IndexSeedWriter>>>;
+}
+
 /// Cache selection for one session cache tier.
 #[derive(Clone, Debug)]
 pub enum CacheSpec {
@@ -65,6 +74,8 @@ pub struct Session {
 
     pub(crate) index_extensions: HashMap<(IndexType, String), Arc<dyn IndexExtension>>,
 
+    pub(crate) index_seed_factories: Vec<Arc<dyn IndexSeedFactory>>,
+
     physical_optimizer_rules: Vec<Arc<dyn PhysicalOptimizerRule + Send + Sync>>,
 
     store_registry: Arc<ObjectStoreRegistry>,
@@ -83,6 +94,8 @@ impl DeepSizeOf for Session {
         }
         size += self.physical_optimizer_rules.capacity()
             * std::mem::size_of::<Arc<dyn PhysicalOptimizerRule + Send + Sync>>();
+        size +=
+            self.index_seed_factories.capacity() * std::mem::size_of::<Arc<dyn IndexSeedFactory>>();
         size
     }
 }
@@ -140,6 +153,7 @@ impl Session {
             ))),
             index_extensions: HashMap::new(),
             physical_optimizer_rules: Vec::new(),
+            index_seed_factories: Vec::new(),
             store_registry,
             spill_store: Arc::new(LocalSpillStore::default()),
         }
@@ -161,6 +175,7 @@ impl Session {
             ))),
             index_extensions: HashMap::new(),
             physical_optimizer_rules: Vec::new(),
+            index_seed_factories: Vec::new(),
             store_registry,
             spill_store: Arc::new(LocalSpillStore::default()),
         }
@@ -189,6 +204,11 @@ impl Session {
     /// state that overflows memory (e.g. index builders).
     pub fn spill_store(&self) -> &dyn SpillStore {
         &*self.spill_store
+    }
+
+    /// Register fragment summaries for appends made through this session.
+    pub fn register_index_seed_factory(&mut self, factory: Arc<dyn IndexSeedFactory>) {
+        self.index_seed_factories.push(factory);
     }
 
     /// Add a physical optimizer rule to every scanner using this session.
@@ -249,6 +269,7 @@ impl Session {
             metadata_cache: GlobalMetadataCache(metadata_cache),
             index_extensions: HashMap::new(),
             physical_optimizer_rules: Vec::new(),
+            index_seed_factories: Vec::new(),
             store_registry,
             spill_store: Arc::new(LocalSpillStore::default()),
         }

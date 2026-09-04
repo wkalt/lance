@@ -654,11 +654,8 @@ where
 
             writer.as_mut().unwrap().write(&batch_chunk).await?;
             for seed_writer in seed_writers.iter_mut() {
-                let col_name = seed_writer.column_name().to_owned();
                 for batch in &batch_chunk {
-                    if let Some(col) = batch.column_by_name(&col_name) {
-                        seed_writer.observe_batch(col)?;
-                    }
+                    seed_writer.observe_record_batch(batch)?;
                 }
             }
             for batch in &batch_chunk {
@@ -1385,6 +1382,9 @@ pub(crate) async fn create_seed_writers_current(
 
     let indices: Arc<Vec<IndexMetadata>> = dataset.load_indices().await?;
     let mut writers: Vec<Box<dyn lance_index::scalar::seed::IndexSeedWriter>> = Vec::new();
+    for factory in &dataset.session.index_seed_factories {
+        writers.extend(factory.create_writers(dataset)?);
+    }
 
     for index in indices.iter() {
         // A covered index lists its carried columns in `fields` too; the seed
