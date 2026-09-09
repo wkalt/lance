@@ -30,6 +30,10 @@ impl From<&DataReplacementGroup> for pb::transaction::DataReplacementGroup {
         Self {
             fragment_id: *fragment_id,
             new_file: Some(new_file.into()),
+            // Written once the operation carries them; see the follow-up that
+            // adds dependency conflicts and offset-scoped version stamping.
+            dependency_field_ids: Vec::new(),
+            mutated_offsets: None,
         }
     }
 }

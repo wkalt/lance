@@ -360,6 +360,29 @@ message Transaction {
   message DataReplacementGroup {
     uint64 fragment_id = 1;
     DataFile new_file = 2;
+    /* Field ids on this fragment whose values were read to compute the values in
+     * new_file. A concurrent transaction that rewrote any of them invalidates
+     * this replacement, which must be recomputed against the new values rather
+     * than committed on top of them.
+     *
+     * This is distinct from the fields new_file writes: a computed column reads
+     * its inputs and writes its output, and only the output appears in
+     * new_file.fields.
+     *
+     * Empty means the replacement declares no inputs and so conflicts only on
+     * the fields it writes. That is how every replacement written before this
+     * field existed is read.
+     */
+    repeated uint32 dependency_field_ids = 3;
+    /* The physical row offsets within the fragment whose values this replacement
+     * wrote, as portable RoaringBitmap bytes -- the encoding
+     * Update.updated_fragment_offset_bitmaps uses.
+     *
+     * When present, only these rows are stamped as updated at commit time. When
+     * absent, every row in the fragment is stamped, which is how every
+     * replacement written before this field existed is read.
+     */
+    optional bytes mutated_offsets = 4;
   }
 
   // An operation that replaces the data in a region of the table with new data.

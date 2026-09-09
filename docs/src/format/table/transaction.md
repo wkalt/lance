@@ -438,15 +438,48 @@ Replaces data in specific column regions with new data files.
 
 ```protobuf
 %%% proto.message.DataReplacement %%%
+
+%%% proto.message.DataReplacementGroup %%%
 ```
 
 </details>
+
+#### Declared dependencies
+
+A replacement may declare the field ids its values were computed from, in
+`dependency_field_ids`. This is what a derived column needs and what the fields it
+writes cannot express: a computed column reads its inputs and writes its output, so
+only the output appears in `new_file.fields`, and a concurrent rewrite of an input
+leaves the committed output stale while conflicting with nothing.
+
+A replacement that declares dependencies conflicts with any concurrent operation that
+rewrote one of those fields on one of its fragments, on top of the conflicts its
+written fields already produce. An empty `dependency_field_ids` declares no inputs and
+keeps the original behavior, which is how replacements written before the field
+existed are read.
+
+Dependency conflicts are reported per operation:
+
+- Update rewriting a dependency in place (its `fields_modified`)
+- DataReplacement writing a dependency on an overlapping fragment
+- DataOverlay supplying new values for a dependency on an overlapping fragment
+- Project dropping a dependency
+- Merge and Rewrite, which are already whole-fragment conflicts
+
+#### Mutated offsets
+
+A replacement may declare the physical row offsets it actually wrote, in
+`mutated_offsets`. Only those rows are stamped as updated at commit, in the same way
+`Update.updated_fragment_offset_bitmaps` stamps a partial column rewrite. When the
+field is absent every row in the fragment is stamped, which is how replacements
+written before the field existed are read.
 
 #### DataReplacement Compatibility
 
 A DataReplacement operation only replaces a single column's worth of data. As a result, it can be safer and simpler than Merge
 or Update operations. It rewrites a column file positionally against the fragments it targets, so a concurrent operation only
-conflicts when it removes one of those fragments or invalidates the rows the column file covers. Here are the operations that
+conflicts when it removes one of those fragments, invalidates the rows the column file covers, or rewrites a field the
+replacement declared as a dependency. Here are the operations that
 conflict with DataReplacement (non-retryable):
 
 - Overwrite
@@ -457,10 +490,12 @@ conflict with DataReplacement (non-retryable):
 
 The following operations are retryable conflicts with DataReplacement:
 
-- DataReplacement (only if same field and overlapping fragments)
+- DataReplacement (only if overlapping fragments and either the same field or a declared dependency)
 - CreateIndex (only if the field being replaced is being indexed)
 - Rewrite (only if overlapping fragments)
-- Update (only if it rewrites rows out of a target fragment, or rewrites one of the replaced fields in place)
+- Update (only if it rewrites rows out of a target fragment, rewrites one of the replaced fields in place, or rewrites a
+  declared dependency)
+- DataOverlay (only if overlapping fragments and it supplies values for a declared dependency)
 - Merge (always)
 
 A concurrent Delete or Update that only adds a deletion vector to a target fragment (without removing it) is compatible: the
