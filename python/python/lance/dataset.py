@@ -6387,10 +6387,24 @@ class LanceOperation:
     class DataReplacementGroup:
         """
         Group of data replacements
+
+        Attributes
+        ----------
+        dependency_field_ids: List[int]
+            Field ids on this fragment whose values were read to compute
+            ``new_file``. A concurrent transaction that rewrote any of them
+            conflicts with this replacement. Empty declares no inputs, so the
+            replacement conflicts only on the fields it writes.
+        mutated_offsets: Optional[List[int]]
+            Physical row offsets within the fragment whose values this
+            replacement wrote. Only those rows are stamped as updated at commit.
+            ``None`` stamps every row in the fragment.
         """
 
         fragment_id: int
         new_file: DataFile
+        dependency_field_ids: List[int] = dataclasses.field(default_factory=list)
+        mutated_offsets: Optional[List[int]] = None
 
     @dataclass
     class DataReplacement(BaseOperation):

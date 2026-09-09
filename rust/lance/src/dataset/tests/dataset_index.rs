@@ -2824,7 +2824,7 @@ async fn test_partial_compound_hybrid_prunes_same_path_different_base_rewrite() 
     let mut dataset = Dataset::commit(
         WriteDestination::Dataset(Arc::new(dataset)),
         Operation::DataReplacement {
-            replacements: vec![DataReplacementGroup(1, replacement_file)],
+            replacements: vec![DataReplacementGroup::new(1, replacement_file)],
         },
         Some(read_version),
         None,

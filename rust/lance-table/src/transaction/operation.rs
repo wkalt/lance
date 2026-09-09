@@ -20,8 +20,62 @@ use roaring::RoaringBitmap;
 use std::collections::HashMap;
 use uuid::Uuid;
 
-#[derive(Debug, Clone, DeepSizeOf, PartialEq)]
-pub struct DataReplacementGroup(pub u64, pub DataFile);
+/// A new data file to place into one fragment, replacing the values of the
+/// fields it carries.
+#[derive(Debug, Clone, PartialEq)]
+pub struct DataReplacementGroup {
+    pub fragment_id: u64,
+    pub new_file: DataFile,
+    /// Field ids on this fragment whose values were read to compute `new_file`.
+    ///
+    /// A concurrent transaction that rewrote any of them invalidates this
+    /// replacement, which conflicts and must be recomputed. Distinct from the
+    /// fields `new_file` writes: a derived column reads its inputs and writes
+    /// its output, and only the output is in `new_file.fields`.
+    ///
+    /// Empty declares no inputs, conflicting only on the written fields.
+    pub dependency_field_ids: Vec<u32>,
+    /// Physical row offsets within the fragment whose values this replacement
+    /// wrote. `Some` stamps only those rows as updated at commit; `None` stamps
+    /// every row in the fragment.
+    pub mutated_offsets: Option<RoaringBitmap>,
+}
+
+impl DataReplacementGroup {
+    /// A replacement declaring no dependencies and no offsets: it conflicts on
+    /// the fields it writes and stamps the whole fragment.
+    pub fn new(fragment_id: u64, new_file: DataFile) -> Self {
+        Self {
+            fragment_id,
+            new_file,
+            dependency_field_ids: Vec::new(),
+            mutated_offsets: None,
+        }
+    }
+
+    /// Declare the field ids these values were computed from.
+    pub fn with_dependencies(mut self, dependency_field_ids: Vec<u32>) -> Self {
+        self.dependency_field_ids = dependency_field_ids;
+        self
+    }
+
+    /// Declare the physical offsets this replacement wrote.
+    pub fn with_mutated_offsets(mut self, mutated_offsets: RoaringBitmap) -> Self {
+        self.mutated_offsets = Some(mutated_offsets);
+        self
+    }
+}
+
+impl DeepSizeOf for DataReplacementGroup {
+    fn deep_size_of_children(&self, context: &mut lance_core::deepsize::Context) -> usize {
+        self.new_file.deep_size_of_children(context)
+            + self.dependency_field_ids.deep_size_of_children(context)
+            + self
+                .mutated_offsets
+                .as_ref()
+                .map_or(0, |b| (b.len() as usize).saturating_mul(size_of::<u32>()))
+    }
+}
 
 /// Overlay files to append to a single fragment, in order (the last entry is
 /// newest). The overlays are appended to the fragment's existing `overlays`

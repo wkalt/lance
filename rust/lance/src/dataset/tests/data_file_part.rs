@@ -153,7 +153,7 @@ async fn concatenates_parts_in_caller_order_without_reusing_staging_files() {
         .write_columns_from_parts(&target, &[second, first])
         .await
         .unwrap();
-    assert_eq!(replacement.1.path, target.file_name());
+    assert_eq!(replacement.new_file.path, target.file_name());
     let dataset = commit(&dataset, replacement).await.unwrap();
     let batch = dataset.scan().try_into_batch().await.unwrap();
     assert_eq!(

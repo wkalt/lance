@@ -5984,7 +5984,7 @@ mod tests {
             read_version: dataset.manifest.version,
             uuid: Uuid::new_v4().hyphenated().to_string(),
             operation: Operation::DataReplacement {
-                replacements: vec![DataReplacementGroup(0, data_file)],
+                replacements: vec![DataReplacementGroup::new(0, data_file)],
             },
             tag: None,
             transaction_properties: None,
@@ -6167,7 +6167,7 @@ mod tests {
             read_version: dataset.manifest.version,
             uuid: Uuid::new_v4().hyphenated().to_string(),
             operation: Operation::DataReplacement {
-                replacements: vec![DataReplacementGroup(0, data_file)],
+                replacements: vec![DataReplacementGroup::new(0, data_file)],
             },
             tag: None,
             transaction_properties: None,

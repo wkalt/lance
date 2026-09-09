@@ -772,7 +772,7 @@ async fn test_datafile_replacement() {
     let dataset = Dataset::commit(
         WriteDestination::Dataset(Arc::new(dataset)),
         Operation::DataReplacement {
-            replacements: vec![DataReplacementGroup(0, new_data_file)],
+            replacements: vec![DataReplacementGroup::new(0, new_data_file)],
         },
         Some(4),
         None,
@@ -889,7 +889,7 @@ async fn test_datafile_partial_replacement() {
     let dataset = Dataset::commit(
         WriteDestination::Dataset(Arc::new(dataset)),
         Operation::DataReplacement {
-            replacements: vec![DataReplacementGroup(0, new_data_file)],
+            replacements: vec![DataReplacementGroup::new(0, new_data_file)],
         },
         Some(3),
         None,
@@ -950,7 +950,7 @@ async fn test_datafile_partial_replacement() {
     let dataset = Dataset::commit(
         WriteDestination::Dataset(Arc::new(dataset)),
         Operation::DataReplacement {
-            replacements: vec![DataReplacementGroup(0, new_data_file)],
+            replacements: vec![DataReplacementGroup::new(0, new_data_file)],
         },
         Some(4),
         None,
@@ -1055,7 +1055,7 @@ async fn test_datafile_replacement_error() {
     let err = Dataset::commit(
         WriteDestination::Dataset(Arc::new(dataset.clone())),
         Operation::DataReplacement {
-            replacements: vec![DataReplacementGroup(0, new_data_file)],
+            replacements: vec![DataReplacementGroup::new(0, new_data_file)],
         },
         // read at the current version (after the Merge above)
         Some(dataset.manifest.version),
@@ -2620,7 +2620,7 @@ async fn test_data_replacement_advances_row_lineage() {
     let dataset = Dataset::commit(
         WriteDestination::Dataset(Arc::new(dataset)),
         Operation::DataReplacement {
-            replacements: vec![DataReplacementGroup(0, new_data_file)],
+            replacements: vec![DataReplacementGroup::new(0, new_data_file)],
         },
         Some(read_version),
         None,
@@ -2729,7 +2729,7 @@ async fn test_data_replacement_invalidates_index_bitmap() {
     let dataset = Dataset::commit(
         WriteDestination::Dataset(Arc::new(dataset)),
         Operation::DataReplacement {
-            replacements: vec![DataReplacementGroup(0, new_data_file)],
+            replacements: vec![DataReplacementGroup::new(0, new_data_file)],
         },
         Some(read_version),
         None,
@@ -3013,7 +3013,7 @@ async fn test_data_replacement_populates_invalidated_bitmap() {
     let dataset = Dataset::commit(
         WriteDestination::Dataset(Arc::new(dataset)),
         Operation::DataReplacement {
-            replacements: vec![DataReplacementGroup(0, new_data_file)],
+            replacements: vec![DataReplacementGroup::new(0, new_data_file)],
         },
         Some(read_version),
         None,
@@ -3132,7 +3132,7 @@ async fn test_fts_stale_entries_after_data_replacement() {
     let dataset = Dataset::commit(
         WriteDestination::Dataset(Arc::new(dataset)),
         Operation::DataReplacement {
-            replacements: vec![DataReplacementGroup(1, new_data_file)],
+            replacements: vec![DataReplacementGroup::new(1, new_data_file)],
         },
         Some(read_version),
         None,
@@ -3272,7 +3272,7 @@ async fn test_cross_column_fast_search_blocks_column_local_stale_postings() {
     let dataset = Dataset::commit(
         WriteDestination::Dataset(Arc::new(dataset)),
         Operation::DataReplacement {
-            replacements: vec![DataReplacementGroup(1, replacement_file)],
+            replacements: vec![DataReplacementGroup::new(1, replacement_file)],
         },
         Some(read_version),
         None,
@@ -3443,7 +3443,7 @@ async fn test_vector_index_after_data_replacement() {
     let dataset = Dataset::commit(
         WriteDestination::Dataset(Arc::new(dataset)),
         Operation::DataReplacement {
-            replacements: vec![DataReplacementGroup(frag1_id, new_data_file)],
+            replacements: vec![DataReplacementGroup::new(frag1_id, new_data_file)],
         },
         Some(read_version),
         None,

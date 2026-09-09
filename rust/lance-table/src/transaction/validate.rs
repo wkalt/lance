@@ -94,6 +94,35 @@ pub fn validate_operation(manifest: Option<&Manifest>, operation: &Operation) ->
             }
             Ok(())
         }
+        Operation::DataReplacement { replacements } => {
+            // Offsets ride on the group, so they cannot name a fragment other
+            // than their own; what they can do is run past its end, where the
+            // stamping helper would silently ignore them. A replacement whose
+            // target is missing is left to the conflict resolver, which reports
+            // a removed target precisely.
+            for replacement in replacements {
+                let Some(offsets) = &replacement.mutated_offsets else {
+                    continue;
+                };
+                let Some(physical_rows) = manifest
+                    .fragments
+                    .iter()
+                    .find(|f| f.id == replacement.fragment_id)
+                    .and_then(|f| f.physical_rows)
+                else {
+                    continue;
+                };
+                if let Some(max_offset) = offsets.max()
+                    && max_offset as usize >= physical_rows
+                {
+                    return Err(Error::invalid_input(format!(
+                        "mutatedOffsets max offset {} exceeds fragment {} row count {}",
+                        max_offset, replacement.fragment_id, physical_rows
+                    )));
+                }
+            }
+            Ok(())
+        }
         _ => Ok(()),
     }
 }

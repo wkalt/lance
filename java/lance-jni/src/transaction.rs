@@ -252,15 +252,23 @@ impl IntoJava for &RewrittenIndex {
 
 impl IntoJava for &DataReplacementGroup {
     fn into_java<'a>(self, env: &mut JNIEnv<'a>) -> Result<JObject<'a>> {
-        let fragment_id = self.0;
-        let new_file = self.1.into_java(env)?;
+        let fragment_id = self.fragment_id;
+        let new_file = (&self.new_file).into_java(env)?;
+        let dependency_field_ids = JLance(self.dependency_field_ids.clone()).into_java(env)?;
+        // Null, not an empty array: absent means the whole fragment is stamped.
+        let mutated_offsets = match &self.mutated_offsets {
+            Some(bitmap) => JLance(bitmap.iter().collect::<Vec<u32>>()).into_java(env)?,
+            None => JObject::null(),
+        };
 
         Ok(env.new_object(
             "org/lance/operation/DataReplacement$DataReplacementGroup",
-            "(JLorg/lance/fragment/DataFile;)V",
+            "(JLorg/lance/fragment/DataFile;[J[J)V",
             &[
                 JValue::Long(u64_to_jlong("dataReplacement.fragmentId", fragment_id)?),
                 JValue::Object(&new_file),
+                JValue::Object(&dependency_field_ids),
+                JValue::Object(&mutated_offsets),
             ],
         )?)
     }
@@ -751,8 +759,31 @@ impl FromJObjectWithEnv<DataReplacementGroup> for JObject<'_> {
             .call_method(self, "replacedFile", "()Lorg/lance/fragment/DataFile;", &[])?
             .l()?
             .extract_object(env)?;
+        let dependency_field_ids = import_field_ids(
+            env,
+            self,
+            "dependencyFieldIds",
+            "dataReplacement.dependencyFieldIds",
+        )?;
+        let mutated_offsets_obj = env.call_method(self, "mutatedOffsets", "()[J", &[])?.l()?;
+        let mutated_offsets = if mutated_offsets_obj.is_null() {
+            None
+        } else {
+            let array = JLongArray::from(mutated_offsets_obj);
+            let mut values = vec![0_i64; env.get_array_length(&array)? as usize];
+            env.get_long_array_region(&array, 0, &mut values)?;
+            Some(RoaringBitmap::from_iter(checked_field_ids(
+                "dataReplacement.mutatedOffsets",
+                &values,
+            )?))
+        };
 
-        Ok(DataReplacementGroup(fragment_id, new_file))
+        Ok(DataReplacementGroup {
+            fragment_id,
+            new_file,
+            dependency_field_ids,
+            mutated_offsets,
+        })
     }
 }
 

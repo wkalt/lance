@@ -17,6 +17,7 @@ import org.lance.fragment.DataFile;
 
 import com.google.common.base.MoreObjects;
 
+import java.util.Arrays;
 import java.util.List;
 import java.util.Objects;
 
@@ -105,16 +106,39 @@ public class DataReplacement implements Operation {
   public static class DataReplacementGroup {
     private final long fragmentId;
     private final DataFile replacedFile;
+    private final long[] dependencyFieldIds;
+    private final long[] mutatedOffsets;
+
+    /**
+     * Create a new DataReplacementGroup that declares no dependencies and no mutated offsets: it
+     * conflicts on the fields it writes and stamps every row in the fragment as updated.
+     *
+     * @param fragmentId the fragment ID
+     * @param replacedFile the new data file to replace old file of the fragment id
+     */
+    public DataReplacementGroup(long fragmentId, DataFile replacedFile) {
+      this(fragmentId, replacedFile, new long[0], null);
+    }
 
     /**
      * Create a new DataReplacementGroup.
      *
      * @param fragmentId the fragment ID
      * @param replacedFile the new data file to replace old file of the fragment id
+     * @param dependencyFieldIds field IDs on this fragment whose values were read to compute the
+     *     replaced file. A concurrent transaction that rewrote any of them conflicts with this
+     *     replacement. Empty declares no inputs, so the replacement conflicts only on the fields it
+     *     writes.
+     * @param mutatedOffsets physical row offsets within the fragment whose values this replacement
+     *     wrote; only those rows are stamped as updated at commit. Null stamps every row in the
+     *     fragment.
      */
-    public DataReplacementGroup(long fragmentId, DataFile replacedFile) {
+    public DataReplacementGroup(
+        long fragmentId, DataFile replacedFile, long[] dependencyFieldIds, long[] mutatedOffsets) {
       this.fragmentId = fragmentId;
       this.replacedFile = replacedFile;
+      this.dependencyFieldIds = dependencyFieldIds;
+      this.mutatedOffsets = mutatedOffsets;
     }
 
     /**
@@ -135,17 +159,42 @@ public class DataReplacement implements Operation {
       return replacedFile;
     }
 
+    /**
+     * Get the field IDs whose values this replacement was computed from.
+     *
+     * @return the dependency field IDs, empty when none are declared
+     */
+    public long[] dependencyFieldIds() {
+      return dependencyFieldIds;
+    }
+
+    /**
+     * Get the physical row offsets this replacement wrote.
+     *
+     * @return the mutated offsets, or null when the whole fragment is stamped
+     */
+    public long[] mutatedOffsets() {
+      return mutatedOffsets;
+    }
+
     @Override
     public boolean equals(Object o) {
       if (this == o) return true;
       if (o == null || getClass() != o.getClass()) return false;
       DataReplacementGroup that = (DataReplacementGroup) o;
-      return fragmentId == that.fragmentId && Objects.equals(replacedFile, that.replacedFile);
+      return fragmentId == that.fragmentId
+          && Objects.equals(replacedFile, that.replacedFile)
+          && Arrays.equals(dependencyFieldIds, that.dependencyFieldIds)
+          && Arrays.equals(mutatedOffsets, that.mutatedOffsets);
     }
 
     @Override
     public int hashCode() {
-      return Objects.hash(fragmentId, replacedFile);
+      return Objects.hash(
+          fragmentId,
+          replacedFile,
+          Arrays.hashCode(dependencyFieldIds),
+          Arrays.hashCode(mutatedOffsets));
     }
 
     @Override
@@ -153,6 +202,8 @@ public class DataReplacement implements Operation {
       return MoreObjects.toStringHelper(this)
           .add("fragmentId", fragmentId)
           .add("replacedFile", replacedFile)
+          .add("dependencyFieldIds", Arrays.toString(dependencyFieldIds))
+          .add("mutatedOffsets", Arrays.toString(mutatedOffsets))
           .toString();
     }
   }

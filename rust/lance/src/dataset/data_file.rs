@@ -471,6 +471,6 @@ impl FileFragment {
             .dataset()
             .concat_data_file_parts(target, ordered_parts)
             .await?;
-        Ok(DataReplacementGroup(self.id() as u64, data_file))
+        Ok(DataReplacementGroup::new(self.id() as u64, data_file))
     }
 }

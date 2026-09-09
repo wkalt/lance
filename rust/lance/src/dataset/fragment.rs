@@ -2479,7 +2479,7 @@ impl FileFragment {
         .await;
 
         match staged {
-            Ok(data_file) => Ok(super::transaction::DataReplacementGroup(
+            Ok(data_file) => Ok(super::transaction::DataReplacementGroup::new(
                 self.id() as u64,
                 data_file,
             )),

@@ -26,14 +26,18 @@ use std::sync::Arc;
 use uuid::Uuid;
 
 impl From<&DataReplacementGroup> for pb::transaction::DataReplacementGroup {
-    fn from(DataReplacementGroup(fragment_id, new_file): &DataReplacementGroup) -> Self {
+    fn from(group: &DataReplacementGroup) -> Self {
         Self {
-            fragment_id: *fragment_id,
-            new_file: Some(new_file.into()),
-            // Written once the operation carries them; see the follow-up that
-            // adds dependency conflicts and offset-scoped version stamping.
-            dependency_field_ids: Vec::new(),
-            mutated_offsets: None,
+            fragment_id: group.fragment_id,
+            new_file: Some((&group.new_file).into()),
+            dependency_field_ids: group.dependency_field_ids.clone(),
+            mutated_offsets: group.mutated_offsets.as_ref().map(|bitmap| {
+                let mut buf = Vec::new();
+                bitmap
+                    .serialize_into(&mut buf)
+                    .expect("RoaringBitmap serialization cannot fail");
+                buf
+            }),
         }
     }
 }
@@ -44,15 +48,28 @@ impl TryFrom<pb::transaction::DataReplacementGroup> for DataReplacementGroup {
     type Error = Error;
 
     fn try_from(message: pb::transaction::DataReplacementGroup) -> Result<Self> {
-        Ok(Self(
-            message.fragment_id,
-            message
+        let fragment_id = message.fragment_id;
+        let mutated_offsets = message
+            .mutated_offsets
+            .map(|bytes| {
+                RoaringBitmap::deserialize_from(bytes.as_slice()).map_err(|e| {
+                    Error::invalid_input(format!(
+                        "invalid mutatedOffsets for fragment {fragment_id}: {e}"
+                    ))
+                })
+            })
+            .transpose()?;
+        Ok(Self {
+            fragment_id,
+            new_file: message
                 .new_file
                 .ok_or(Error::invalid_input(
                     "DataReplacementGroup must have a new_file",
                 ))?
                 .try_into()?,
-        ))
+            dependency_field_ids: message.dependency_field_ids,
+            mutated_offsets,
+        })
     }
 }
 
@@ -857,5 +874,100 @@ mod tests {
             }
             other => panic!("expected DataOverlay, got {other:?}"),
         }
+    }
+
+    fn data_replacement_txn(group: pb::transaction::DataReplacementGroup) -> Transaction {
+        Transaction::try_from(pb::Transaction {
+            read_version: 1,
+            uuid: Uuid::new_v4().to_string(),
+            operation: Some(pb::transaction::Operation::DataReplacement(
+                pb::transaction::DataReplacement {
+                    replacements: vec![group],
+                },
+            )),
+            ..Default::default()
+        })
+        .unwrap()
+    }
+
+    fn only_replacement(txn: Transaction) -> DataReplacementGroup {
+        match txn.operation {
+            Operation::DataReplacement { mut replacements } => {
+                assert_eq!(replacements.len(), 1);
+                replacements.pop().unwrap()
+            }
+            other => panic!("expected DataReplacement, got {other:?}"),
+        }
+    }
+
+    #[rstest::rstest]
+    #[case::declared(vec![2, 5], Some(RoaringBitmap::from_iter([1u32, 4])))]
+    #[case::dependencies_only(vec![2, 5], None)]
+    #[case::offsets_only(vec![], Some(RoaringBitmap::from_iter([0u32])))]
+    #[case::neither(vec![], None)]
+    fn test_data_replacement_dependencies_round_trip(
+        #[case] dependency_field_ids: Vec<u32>,
+        #[case] mutated_offsets: Option<RoaringBitmap>,
+    ) {
+        let group = DataReplacementGroup {
+            fragment_id: 7,
+            new_file: DataFile::new_legacy_from_fields("out.lance", vec![3], None),
+            dependency_field_ids: dependency_field_ids.clone(),
+            mutated_offsets: mutated_offsets.clone(),
+        };
+
+        let decoded = only_replacement(data_replacement_txn((&group).into()));
+
+        assert_eq!(decoded.fragment_id, 7);
+        assert_eq!(decoded.dependency_field_ids, dependency_field_ids);
+        assert_eq!(decoded.mutated_offsets, mutated_offsets);
+    }
+
+    #[test]
+    fn test_data_replacement_written_before_the_fields_existed() {
+        // A manifest whose DataReplacementGroup carries neither field -- every
+        // one written before they existed -- reads as declaring no inputs and
+        // no offsets, which is the behavior it had when it was written.
+        let decoded = only_replacement(data_replacement_txn(
+            pb::transaction::DataReplacementGroup {
+                fragment_id: 7,
+                new_file: Some(
+                    (&DataFile::new_legacy_from_fields("out.lance", vec![3], None)).into(),
+                ),
+                ..Default::default()
+            },
+        ));
+
+        assert!(decoded.dependency_field_ids.is_empty());
+        assert!(decoded.mutated_offsets.is_none());
+    }
+
+    #[test]
+    fn test_data_replacement_rejects_corrupt_mutated_offsets() {
+        let err = Transaction::try_from(pb::Transaction {
+            read_version: 1,
+            uuid: Uuid::new_v4().to_string(),
+            operation: Some(pb::transaction::Operation::DataReplacement(
+                pb::transaction::DataReplacement {
+                    replacements: vec![pb::transaction::DataReplacementGroup {
+                        fragment_id: 7,
+                        new_file: Some(
+                            (&DataFile::new_legacy_from_fields("out.lance", vec![3], None)).into(),
+                        ),
+                        dependency_field_ids: vec![],
+                        mutated_offsets: Some(vec![0xff, 0xff, 0xff]),
+                    }],
+                },
+            )),
+            ..Default::default()
+        })
+        .unwrap_err();
+
+        assert!(matches!(err, Error::InvalidInput { .. }), "got {err:?}");
+        assert!(
+            err.to_string()
+                .contains("invalid mutatedOffsets for fragment 7"),
+            "got {err}"
+        );
     }
 }

@@ -283,7 +283,7 @@ async fn test_records_writer_layout(
 
     // Streamed as two batches: the DataFile must record the writer's
     // field/column layout and the dataset's file version.
-    let DataReplacementGroup(replaced, data_file) = fragment
+    let group = fragment
         .write_columns(
             stream::iter([
                 Ok(arrow_array::record_batch!(("value", Int32, [1])).unwrap()),
@@ -293,6 +293,7 @@ async fn test_records_writer_layout(
         )
         .await
         .unwrap();
+    let (replaced, data_file) = (group.fragment_id, group.new_file);
 
     assert_eq!(replaced, fragment.id() as u64);
     assert_eq!(data_file.fields.as_ref(), &[schema.fields[0].id]);
@@ -545,7 +546,7 @@ async fn test_takes_layout_from_manifest() {
     .unwrap();
     // Unpacked, the file would cover x and y instead, and DataReplacement would
     // see coverage the packed field never had.
-    assert_eq!(group.1.fields.as_ref(), &[packed_field_id]);
+    assert_eq!(group.new_file.fields.as_ref(), &[packed_field_id]);
 
     assert_eq!(
         committed_points(&dataset, group).await,
@@ -703,7 +704,7 @@ async fn test_stages_blob_column() {
         .await
         .unwrap();
     assert!(
-        !group.1.fields.as_ref().is_empty(),
+        !group.new_file.fields.as_ref().is_empty(),
         "staged file must cover the blob field"
     );
 }

@@ -34,8 +34,8 @@ use crate::transaction::row_version::resolve_update_version_metadata;
 use crate::transaction::update_map::apply_update_map;
 use crate::transaction::validate::merge_fragment_physically_rewritten;
 use crate::transaction::{
-    CoverageIdentity, DataReplacementGroup, LogicalIndexSegments, Operation, ReadVersionState,
-    RewriteGroup, Transaction, UpdatedFragmentOffsets,
+    CoverageIdentity, LogicalIndexSegments, Operation, ReadVersionState, RewriteGroup, Transaction,
+    UpdatedFragmentOffsets,
 };
 use lance_core::datatypes::{
     LANCE_UNENFORCED_CLUSTERING_KEY_POSITION, LANCE_UNENFORCED_PRIMARY_KEY,
@@ -950,7 +950,7 @@ impl Transaction {
 
                 let (old_fragment_ids, new_datafiles): (Vec<&u64>, Vec<&DataFile>) = replacements
                     .iter()
-                    .map(|DataReplacementGroup(fragment_id, new_file)| (fragment_id, new_file))
+                    .map(|group| (&group.fragment_id, &group.new_file))
                     .unzip();
 
                 // 1. make sure the new files all have the same fields / or empty
@@ -1145,16 +1145,55 @@ impl Transaction {
                 // A replacement changes what its rows read as, so stamp them
                 // updated. Without this, get_updated_rows never reports them and
                 // an incremental consumer skips them for good.
+                //
+                // A replacement that declared the offsets it wrote stamps only
+                // those rows; one that declared none stamps the whole fragment.
+                // Two replacements on one fragment take the union, and a single
+                // undeclared one makes the fragment whole-stamped.
                 if next_row_id.is_some() {
                     let new_version = current_manifest.map_or(1, |m| m.version + 1);
+                    let prev_version = current_manifest.map_or(0, |m| m.version);
+                    let mut declared: HashMap<u64, Option<RoaringBitmap>> = HashMap::new();
+                    for replacement in replacements {
+                        let slot = declared
+                            .entry(replacement.fragment_id)
+                            .or_insert_with(|| Some(RoaringBitmap::new()));
+                        match (&mut *slot, &replacement.mutated_offsets) {
+                            (Some(acc), Some(offsets)) => *acc |= offsets,
+                            _ => *slot = None,
+                        }
+                    }
+
                     for fragment in final_fragments
                         .iter_mut()
                         .filter(|f| fragments_changed.contains(&f.id))
                     {
-                        crate::rowids::version::refresh_row_latest_update_meta_for_full_frag_rewrite_cols(
-                            fragment,
-                            new_version,
-                        )?;
+                        let offsets = declared.get(&fragment.id).and_then(|o| o.as_ref());
+                        // Without existing metadata the partial helper would fill
+                        // unmatched rows with prev_version, fabricating a stamp for
+                        // rows that never had one; stamp whole-fragment instead, as
+                        // every replacement did before offsets existed.
+                        let partial = offsets
+                            .filter(|b| !b.is_empty())
+                            .filter(|_| fragment.last_updated_at_version_meta.is_some());
+                        match partial {
+                            Some(bitmap) => {
+                                let offsets: Vec<usize> =
+                                    bitmap.iter().map(|o| o as usize).collect();
+                                crate::rowids::version::refresh_row_latest_update_meta_for_partial_frag_rewrite_cols(
+                                    fragment,
+                                    &offsets,
+                                    new_version,
+                                    prev_version,
+                                )?;
+                            }
+                            None => {
+                                crate::rowids::version::refresh_row_latest_update_meta_for_full_frag_rewrite_cols(
+                                    fragment,
+                                    new_version,
+                                )?;
+                            }
+                        }
                     }
                 }
 
@@ -1555,7 +1594,9 @@ mod tests {
         default_build_config, make_stable_row_id_manifest, overlay_with_field,
         sample_index_metadata, sample_manifest,
     };
-    use crate::transaction::{DataOverlayGroup, UpdateMode, validate_operation};
+    use crate::transaction::{
+        DataOverlayGroup, DataReplacementGroup, UpdateMode, validate_operation,
+    };
     use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema};
     use lance_core::datatypes::Schema as LanceSchema;
     use lance_file::version::{ConcreteFileVersion, LanceFileVersion};
@@ -1836,6 +1877,125 @@ mod tests {
         assert!(
             out.fragments[0].last_updated_at_version_meta.is_none(),
             "fragment with no prior version metadata must not have fabricated prev_version stamped on unmatched rows"
+        );
+    }
+
+    /// A replacement that declares the offsets it wrote stamps only those rows;
+    /// one that declares none stamps the whole fragment, as it always has.
+    #[rstest::rstest]
+    #[case::declared_offsets(Some(RoaringBitmap::from_iter([1u32, 3])), vec![1, 5, 1, 5, 1])]
+    #[case::no_offsets(None, vec![5, 5, 5, 5, 5])]
+    fn test_data_replacement_stamps_declared_offsets(
+        #[case] mutated_offsets: Option<RoaringBitmap>,
+        #[case] expected_versions: Vec<u64>,
+    ) {
+        let row_ids = RowIdSequence::from([10u64, 11, 12, 13, 14].as_slice());
+        let version_seq = RowDatasetVersionSequence::from_uniform_row_count(5, 1);
+        let version_meta = RowDatasetVersionMeta::from_sequence(&version_seq).unwrap();
+        let fragment = Fragment {
+            id: 1,
+            files: vec![DataFile::new(
+                "data.lance",
+                vec![0],
+                vec![0],
+                LanceFileVersion::Stable.resolve(),
+                None,
+                None,
+            )],
+            overlays: vec![],
+            deletion_file: None,
+            row_id_meta: Some(RowIdMeta::Inline(write_row_ids(&row_ids).into())),
+            physical_rows: Some(5),
+            last_updated_at_version_meta: Some(version_meta.clone()),
+            created_at_version_meta: Some(version_meta),
+        };
+        let manifest = make_stable_row_id_manifest(vec![fragment]);
+
+        let tx = Transaction::new(
+            manifest.version,
+            Operation::DataReplacement {
+                replacements: vec![DataReplacementGroup {
+                    fragment_id: 1,
+                    new_file: DataFile::new(
+                        "replaced.lance",
+                        vec![0],
+                        vec![0],
+                        LanceFileVersion::Stable.resolve(),
+                        None,
+                        None,
+                    ),
+                    dependency_field_ids: vec![],
+                    mutated_offsets,
+                }],
+            },
+            None,
+        );
+
+        let out = tx
+            .build_manifest(Some(&manifest), vec![], "txn", &default_build_config())
+            .unwrap()
+            .0;
+
+        let sequence = out.fragments[0]
+            .last_updated_at_version_meta
+            .as_ref()
+            .unwrap()
+            .load_sequence()
+            .unwrap();
+        let actual: Vec<u64> = (0..5).map(|i| sequence.version_at(i).unwrap()).collect();
+        assert_eq!(actual, expected_versions);
+    }
+
+    #[test]
+    fn test_data_replacement_offsets_past_end_of_fragment() {
+        let version_seq = RowDatasetVersionSequence::from_uniform_row_count(5, 1);
+        let version_meta = RowDatasetVersionMeta::from_sequence(&version_seq).unwrap();
+        let fragment = Fragment {
+            id: 1,
+            files: vec![DataFile::new(
+                "data.lance",
+                vec![0],
+                vec![0],
+                LanceFileVersion::Stable.resolve(),
+                None,
+                None,
+            )],
+            overlays: vec![],
+            deletion_file: None,
+            row_id_meta: None,
+            physical_rows: Some(5),
+            last_updated_at_version_meta: Some(version_meta.clone()),
+            created_at_version_meta: Some(version_meta),
+        };
+        let manifest = make_stable_row_id_manifest(vec![fragment]);
+
+        let err = validate_operation(
+            Some(&manifest),
+            &Operation::DataReplacement {
+                replacements: vec![DataReplacementGroup {
+                    fragment_id: 1,
+                    new_file: DataFile::new(
+                        "replaced.lance",
+                        vec![0],
+                        vec![0],
+                        LanceFileVersion::Stable.resolve(),
+                        None,
+                        None,
+                    ),
+                    dependency_field_ids: vec![],
+                    mutated_offsets: Some(RoaringBitmap::from_iter([0u32, 100])),
+                }],
+            },
+        )
+        .unwrap_err();
+
+        assert!(matches!(err, Error::InvalidInput { .. }), "got {err:?}");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("mutatedOffsets max offset 100")
+                && msg.contains("fragment 1")
+                && msg.contains("row count 5"),
+            "got: {msg}"
         );
     }
 
@@ -2616,7 +2776,7 @@ mod tests {
         let txn = Transaction::new(
             manifest.version,
             Operation::DataReplacement {
-                replacements: vec![DataReplacementGroup(
+                replacements: vec![DataReplacementGroup::new(
                     0,
                     DataFile::new_legacy_from_fields("f5-new.lance", vec![5], None),
                 )],
@@ -2669,7 +2829,7 @@ mod tests {
         let txn = Transaction::new(
             read_version,
             Operation::DataReplacement {
-                replacements: vec![DataReplacementGroup(
+                replacements: vec![DataReplacementGroup::new(
                     0,
                     DataFile::new(
                         "v-new.lance",

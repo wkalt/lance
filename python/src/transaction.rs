@@ -190,8 +190,23 @@ impl FromPyObject<'_, '_> for PyLance<DataReplacementGroup> {
     fn extract(ob: Borrowed<'_, '_, PyAny>) -> PyResult<Self> {
         let fragment_id = ob.getattr("fragment_id")?.extract::<u64>()?;
         let new_file = &ob.getattr("new_file")?.extract::<PyLance<DataFile>>()?;
+        let dependency_field_ids = ob
+            .getattr("dependency_field_ids")?
+            .extract::<Option<Vec<u32>>>()?
+            .unwrap_or_default();
+        // A set of offsets, so ascending order is not required the way it is for
+        // an overlay's positionally-mapped coverage.
+        let mutated_offsets = ob
+            .getattr("mutated_offsets")?
+            .extract::<Option<Vec<u32>>>()?
+            .map(RoaringBitmap::from_iter);
 
-        Ok(Self(DataReplacementGroup(fragment_id, new_file.0.clone())))
+        Ok(Self(DataReplacementGroup {
+            fragment_id,
+            new_file: new_file.0.clone(),
+            dependency_field_ids,
+            mutated_offsets,
+        }))
     }
 }
 
@@ -206,13 +221,24 @@ impl<'py> IntoPyObject<'py> for PyLance<&DataReplacementGroup> {
             .and_then(|module| module.getattr(intern!(py, "LanceOperation")))
             .expect("Failed to import LanceOperation namespace");
 
-        let fragment_id = self.0.0;
-        let new_file = PyLance(&self.0.1).into_pyobject(py)?;
+        let fragment_id = self.0.fragment_id;
+        let new_file = PyLance(&self.0.new_file).into_pyobject(py)?;
+        let dependency_field_ids = self.0.dependency_field_ids.clone();
+        let mutated_offsets = self
+            .0
+            .mutated_offsets
+            .as_ref()
+            .map(|b| b.iter().collect::<Vec<u32>>());
 
         let cls = namespace
             .getattr("DataReplacementGroup")
             .expect("Failed to get DataReplacementGroup class");
-        cls.call1((fragment_id, new_file))
+        cls.call1((
+            fragment_id,
+            new_file,
+            dependency_field_ids,
+            mutated_offsets,
+        ))
     }
 }
 
